@@ -38,4 +38,5 @@ torchrun \
     --full_dim_l1_weight 0.0 \
     --align_l1_weights "64:0.6,128:0.6,256:0.6,512:0.6,1024:0.6" \
     --orthogonal_weight 0.01 \
+    --adaptive_cycle_weight 0.05 \
     
