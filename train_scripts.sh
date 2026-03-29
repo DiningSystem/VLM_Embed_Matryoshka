@@ -16,7 +16,7 @@ torchrun \
     --subset_name "OK-VQA" \
     --dataset_split "original" \
     --image_dir "/workspace/ComfyUI/models/gligen/VLM_Embed/vlm2vec_train/MMEB-train" \
-    --output_dir "training/MRL_fastVLM" \
+    --output_dir "training/AdaptiveMRL_SmolVLM_stage1" \
     --per_device_train_batch_size 16 \
     --gradient_accumulation_steps 1 \
     --lr_scheduler_type cosine \
@@ -28,6 +28,8 @@ torchrun \
     --save_strategy "epoch" \
     --seed 42 \
     --weight_decay 0.01 \
-    --kd_loss_type mrl \
+    --kd_loss_type adaptive_mrl_stage1 \
+    --stage1_phase all \
+    --adaptive_cycle_weight 0.05 \
     --warmup_ratio 0.03 \
     --image_resolution low

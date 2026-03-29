@@ -158,6 +158,10 @@ class TrainingArguments(TrainingArguments):
         default="",
         metadata={"help": "Optional per-projection orthogonality weights. Format: '1024->512:1.0,512->256:0.7' (or '1024:512:1.0')."},
     )
+    adaptive_cycle_weight: float = field(
+        default=0.0,
+        metadata={"help": "Weight for cross-modal cycle contribution (text<->vision) in Adaptive Matryoshka Stage-1."},
+    )
     router_alpha: float = field(
         default=0.01,
         metadata={"help": "Compute penalty weight for Adaptive Matryoshka Stage-2 router training."},

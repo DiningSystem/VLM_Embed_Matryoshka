@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -17,6 +18,7 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
       1) CLIP-style cross-modal alignment on a chosen student prefix.
       2) Curriculum training across nested dimensions with trainable projections.
       3) Orthogonality regularization on each projection matrix (P^T P -> I).
+      4) Optional cross-modal cycle contribution from sliced token attention maps.
 
     Supported prefix chain (default): [64, 128, 256, 512, 768, 1024].
     Curriculum stage pairs are built from:
@@ -37,6 +39,7 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         self.full_dim_l1_weight = float(getattr(args, "full_dim_l1_weight", 0.0))
         self.orthogonal_weight = float(getattr(args, "orthogonal_weight", 0.01))
         self.orthogonal_pair_weights = self._parse_pair_weight_map(getattr(args, "orthogonal_pair_weights", ""))
+        self.cycle_weight = float(getattr(args, "adaptive_cycle_weight", 0.0))
         self.projection_weights = self._parse_pair_weight_map(getattr(args, "stage1_projection_weights", ""))
         self.dim_align_l1_weights = self._parse_dim_weight_map(getattr(args, "align_l1_weights", ""))
 
@@ -120,6 +123,90 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         if full_dim not in valid_dims:
             valid_dims.append(full_dim)
         return sorted(set(valid_dims))
+
+    def _resolve_image_token_ids(self, model_backbone: Optional[str]) -> List[int]:
+        # Backbone-dependent image placeholder ids in this repo.
+        mapping = {
+            "llava_next": [32000],
+            "llava_onevision": [151646],
+            "llava_qwen2": [32000],
+            "qwen2_vl": [151655],
+            "qwen2_5_vl": [151655],
+            "qwen2_vl_tokenselection": [151655],
+            "qwen2_5_vl_tokenselection": [151655],
+            "qwen3_vl": [151655],
+            "idefics3": [128257],  # SmolVLM "<image>"
+        }
+        return mapping.get(str(model_backbone), [151655, 32000, 151646])
+
+    def _extract_text_vision_masks(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        model_backbone: Optional[str],
+    ) -> Tuple[Tensor, Tensor]:
+        image_token_ids = self._resolve_image_token_ids(model_backbone)
+        valid_mask = attention_mask.bool()
+        vision_mask = torch.zeros_like(valid_mask)
+        for token_id in image_token_ids:
+            vision_mask = vision_mask | (input_ids == token_id)
+        vision_mask = vision_mask & valid_mask
+        text_mask = valid_mask & (~vision_mask)
+        return text_mask, vision_mask
+
+    def _cross_modal_cycle_loss(
+        self,
+        hidden_state: Tensor,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        adjacent_pairs: List[Tuple[int, int]],
+        model_backbone: Optional[str],
+    ) -> Tensor:
+        text_mask, vision_mask = self._extract_text_vision_masks(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            model_backbone=model_backbone,
+        )
+        if not adjacent_pairs:
+            return torch.zeros((), device=hidden_state.device, dtype=hidden_state.dtype)
+
+        total_loss = torch.zeros((), device=hidden_state.device, dtype=hidden_state.dtype)
+        count = 0
+        for src_dim, dst_dim in adjacent_pairs:
+            hs_src = F.normalize(hidden_state[:, :, :src_dim], p=2, dim=-1)
+            hs_dst = F.normalize(hidden_state[:, :, :dst_dim], p=2, dim=-1)
+
+            sim_src = torch.matmul(hs_src, hs_src.transpose(1, 2)) / math.sqrt(float(max(src_dim, 1)))
+            sim_dst = torch.matmul(hs_dst, hs_dst.transpose(1, 2)) / math.sqrt(float(max(dst_dim, 1)))
+
+            key_mask = attention_mask[:, None, :].bool()
+            sim_src = sim_src.masked_fill(~key_mask, -1e4)
+            sim_dst = sim_dst.masked_fill(~key_mask, -1e4)
+
+            attn_src = torch.softmax(sim_src, dim=-1)
+            attn_dst = torch.softmax(sim_dst, dim=-1)
+
+            for b in range(hidden_state.size(0)):
+                t_idx = text_mask[b].nonzero(as_tuple=False).squeeze(-1)
+                v_idx = vision_mask[b].nonzero(as_tuple=False).squeeze(-1)
+                if t_idx.numel() == 0 or v_idx.numel() == 0:
+                    continue
+                a_vt_src = attn_src[b].index_select(0, v_idx).index_select(1, t_idx)
+                a_tv_src = attn_src[b].index_select(0, t_idx).index_select(1, v_idx)
+                a_vt_dst = attn_dst[b].index_select(0, v_idx).index_select(1, t_idx)
+                a_tv_dst = attn_dst[b].index_select(0, t_idx).index_select(1, v_idx)
+
+                vtv_src = torch.matmul(a_vt_src, a_tv_src)
+                tvt_src = torch.matmul(a_tv_src, a_vt_src)
+                vtv_dst = torch.matmul(a_vt_dst, a_tv_dst)
+                tvt_dst = torch.matmul(a_tv_dst, a_vt_dst)
+
+                total_loss = total_loss + F.l1_loss(vtv_src, vtv_dst) + F.l1_loss(tvt_src, tvt_dst)
+                count += 1
+
+        if count == 0:
+            return torch.zeros((), device=hidden_state.device, dtype=hidden_state.dtype)
+        return total_loss / float(count)
 
     def _parse_dim_weight_map(self, spec) -> Dict[int, float]:
         """
@@ -264,12 +351,26 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         qry_input = input_data["qry"]
         pos_input = input_data["pos"]
 
-        qry_full = model.encode_input(qry_input)[0]
-        pos_full = model.encode_input(pos_input)[0]
+        qry_output = model.encode_input(qry_input, output_hidden_states=True, output_attentions=False)
+        pos_output = model.encode_input(pos_input, output_hidden_states=True, output_attentions=False)
 
+        if isinstance(qry_output, tuple):
+            qry_full = qry_output[0]
+            qry_hidden_states = qry_output[3] if len(qry_output) > 3 else None
+        else:
+            qry_full = qry_output
+            qry_hidden_states = None
+        if isinstance(pos_output, tuple):
+            pos_full = pos_output[0]
+        else:
+            pos_full = pos_output
+
+        qry_last_hidden = qry_hidden_states[-1] if qry_hidden_states is not None else None
         if self.world_size > 1:
             qry_full = self._dist_gather_tensor(qry_full)
             pos_full = self._dist_gather_tensor(pos_full)
+            if qry_last_hidden is not None:
+                qry_last_hidden = self._dist_gather_tensor(qry_last_hidden)
 
         full_dim = qry_full.size(-1)
         valid_dims = self._resolve_dims(full_dim)
@@ -317,6 +418,7 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             metrics["contrastive_loss"] = weighted_align_loss.detach()
             metrics["align_loss"] = weighted_align_loss.detach()
             metrics["orthogonal_loss"] = torch.zeros_like(weighted_align_loss).detach()
+            metrics["cycle_loss"] = torch.zeros_like(weighted_align_loss).detach()
             return metrics
 
         for idx in selected_ids:
@@ -352,7 +454,10 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
                 orth_pair_weight = 1.0
                 orth_loss = torch.zeros_like(weighted_align_loss)
 
-            total = projection_weight * weighted_align_loss + self.orthogonal_weight * projection_weight * orth_loss
+            total = (
+                projection_weight * weighted_align_loss
+                + self.orthogonal_weight * projection_weight * orth_loss
+            )
 
             metrics[f"align_ce_{teacher_dim}_to_{student_dim}"] = align_ce.detach()
             metrics[f"align_l1_{teacher_dim}_to_{student_dim}"] = align_l1.detach()
@@ -371,12 +476,39 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         mean_align_loss = torch.stack(align_losses).mean()
         mean_orth_loss = torch.stack(orth_losses).mean()
 
+        cycle_loss = torch.zeros_like(final_loss)
+        if (
+            self.cycle_weight > 0.0
+            and qry_last_hidden is not None
+            and "input_ids" in qry_input
+            and "attention_mask" in qry_input
+        ):
+            qry_input_ids = qry_input["input_ids"]
+            qry_attn_mask = qry_input["attention_mask"]
+            if self.world_size > 1:
+                qry_input_ids = self._dist_gather_tensor(qry_input_ids)
+                qry_attn_mask = self._dist_gather_tensor(qry_attn_mask)
+            adjacent_pairs = []
+            for src_dim, dst_dim in stage_pairs:
+                if src_dim > dst_dim and not any(src_dim > mid > dst_dim for mid in valid_dims):
+                    adjacent_pairs.append((src_dim, dst_dim))
+            adjacent_pairs = list(dict.fromkeys(adjacent_pairs))
+            cycle_loss = self._cross_modal_cycle_loss(
+                hidden_state=qry_last_hidden,
+                input_ids=qry_input_ids,
+                attention_mask=qry_attn_mask,
+                adjacent_pairs=adjacent_pairs,
+                model_backbone=getattr(model, "model_backbone", None),
+            )
+            final_loss = final_loss + self.cycle_weight * cycle_loss
+
         # Keep `contrastive_loss` for compatibility with existing trainer logging.
         metrics["loss"] = final_loss
         metrics["total_loss"] = final_loss.detach()
         metrics["contrastive_loss"] = mean_align_loss
         metrics["align_loss"] = mean_align_loss.detach()
         metrics["orthogonal_loss"] = mean_orth_loss.detach()
+        metrics["cycle_loss"] = cycle_loss.detach()
         return metrics
 
 
