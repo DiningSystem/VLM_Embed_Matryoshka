@@ -162,6 +162,23 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         adjacent_pairs: List[Tuple[int, int]],
         model_backbone: Optional[str],
     ) -> Tensor:
+        seq_len = hidden_state.size(1)
+        if input_ids.size(1) != seq_len or attention_mask.size(1) != seq_len:
+            aligned_input_ids = []
+            aligned_attention_mask = []
+            for b in range(hidden_state.size(0)):
+                valid_tokens = input_ids[b][attention_mask[b].bool()]
+                take = min(valid_tokens.numel(), seq_len)
+                sample_ids = torch.zeros(seq_len, dtype=input_ids.dtype, device=input_ids.device)
+                sample_mask = torch.zeros(seq_len, dtype=attention_mask.dtype, device=attention_mask.device)
+                if take > 0:
+                    sample_ids[:take] = valid_tokens[:take]
+                    sample_mask[:take] = 1
+                aligned_input_ids.append(sample_ids)
+                aligned_attention_mask.append(sample_mask)
+            input_ids = torch.stack(aligned_input_ids, dim=0)
+            attention_mask = torch.stack(aligned_attention_mask, dim=0)
+
         text_mask, vision_mask = self._extract_text_vision_masks(
             input_ids=input_ids,
             attention_mask=attention_mask,
