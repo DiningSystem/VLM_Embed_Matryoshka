@@ -205,27 +205,36 @@ class MMEBModel(nn.Module):
     def _pooling(self, last_hidden_state, attention_mask):
         if self.pooling == 'last' or self.pooling == 'eos':
             if getattr(self, "model_backbone", None) in [QWEN3_VL]:
-                # print("Applying pooling for Qwen3VL backbone")
+                # For causal LMs, hidden state at position t predicts token t+1.
+                # Use the state right before EOS so the representation includes all
+                # attended text/vision context used to predict EOS.
                 flipped_tensor = attention_mask.flip(dims=[1])
                 last_one_positions = flipped_tensor.argmax(dim=1)
-                col = attention_mask.shape[1] - last_one_positions - 1
+                eos_col = attention_mask.shape[1] - last_one_positions - 1
+                col = torch.clamp(eos_col - 1, min=0)
                 row = torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device)
                 return last_hidden_state[row, col]
             else:
                 left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
                 batch_size = last_hidden_state.shape[0]
                 if left_padding:
-                    # Get the vectors at the last position
-                    reps = last_hidden_state[torch.arange(batch_size), -1, :]
+                    # Left-padded inputs: active tokens end at sequence tail.
+                    # Take the token before the last token (assumed EOS).
+                    seq_len = attention_mask.long().sum(dim=1)
+                    pre_eos_indices = torch.clamp(seq_len - 2, min=0)
+                    reps = last_hidden_state[
+                        torch.arange(batch_size, device=last_hidden_state.device),
+                        pre_eos_indices,
+                    ]
                 else:
-                    # Calculate last 1 position in the original tensor
+                    # Right-padded inputs: locate EOS as last valid token, then shift to pre-EOS.
                     max_length = last_hidden_state.size(1)
                     invert_mask = (attention_mask == 0).long()
                     num_padding_tokens = invert_mask.sum(dim=1)
                     eos_indices_positive = max_length - num_padding_tokens - 1
-                    # Get the vectors at the last 1 position of each attention mask
+                    pre_eos_indices = torch.clamp(eos_indices_positive - 1, min=0)
                     reps = last_hidden_state[
-                        torch.arange(batch_size, device=last_hidden_state.device), eos_indices_positive]
+                        torch.arange(batch_size, device=last_hidden_state.device), pre_eos_indices]
 
         else:
             raise NotImplementedError
