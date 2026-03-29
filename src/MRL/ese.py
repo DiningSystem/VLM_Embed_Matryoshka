@@ -39,15 +39,21 @@ class ESELoss(nn.Module):
         
         left_padding = (attention_mask[:, -1].sum() == batch_size)
         if left_padding:
-            return hidden_state[:, -1, :]
+            # Pre-EOS token hidden state is the representation that predicts EOS.
+            seq_len = attention_mask.long().sum(dim=1)
+            pre_eos_indices = torch.clamp(seq_len - 2, min=0)
+            row = torch.arange(batch_size, device=device)
+            hidden_state = F.normalize(hidden_state, p=2, dim=-1)
+            return hidden_state[row, pre_eos_indices]
         
         max_length = hidden_state.size(1)
         num_padding_tokens = (attention_mask == 0).long().sum(dim=1)
         eos_indices = max_length - num_padding_tokens - 1
+        pre_eos_indices = torch.clamp(eos_indices - 1, min=0)
         row = torch.arange(batch_size, device=device)
         # normalize eos embeddings to prevent large variance across layers
         hidden_state = F.normalize(hidden_state, p=2, dim=-1)
-        return hidden_state[row, eos_indices]
+        return hidden_state[row, pre_eos_indices]
     
     def _matryoshka_contrastive_loss(
         self,
