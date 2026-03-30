@@ -30,6 +30,8 @@ torchrun \
     --weight_decay 0.01 \
     --kd_loss_type adaptive_mrl_stage1 \
     --stage1_phase all \
-    --adaptive_cycle_weight 0.05 \
+    --residual_gate_weight 0.1 \
+    --residual_orth_weight 0.01 \
+    --residual_entropy_weight 0.001 \
     --warmup_ratio 0.03 \
     --image_resolution low

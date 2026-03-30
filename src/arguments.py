@@ -158,9 +158,17 @@ class TrainingArguments(TrainingArguments):
         default="",
         metadata={"help": "Optional per-projection orthogonality weights. Format: '1024->512:1.0,512->256:0.7' (or '1024:512:1.0')."},
     )
-    adaptive_cycle_weight: float = field(
-        default=0.0,
-        metadata={"help": "Weight for cross-modal cycle contribution (text<->vision) in Adaptive Matryoshka Stage-1."},
+    residual_gate_weight: float = field(
+        default=0.1,
+        metadata={"help": "Weight of residual-gated adjacent-dimension InfoNCE-logit L1 term in Adaptive Matryoshka Stage-1."},
+    )
+    residual_orth_weight: float = field(
+        default=0.01,
+        metadata={"help": "Weight of residual-to-small orthogonality regularizer in Adaptive Matryoshka Stage-1."},
+    )
+    residual_entropy_weight: float = field(
+        default=0.001,
+        metadata={"help": "Weight of entropy regularizer on residual gating coefficients in Adaptive Matryoshka Stage-1."},
     )
     router_alpha: float = field(
         default=0.01,

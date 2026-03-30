@@ -18,7 +18,7 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
       1) CLIP-style cross-modal alignment on a chosen student prefix.
       2) Curriculum training across nested dimensions with trainable projections.
       3) Orthogonality regularization on each projection matrix (P^T P -> I).
-      4) Optional cross-modal cycle contribution from sliced token attention maps.
+      4) Residual-gated adjacent-dimension consistency + residual regularizers.
 
     Supported prefix chain (default): [64, 128, 256, 512, 768, 1024].
     Curriculum stage pairs are built from:
@@ -39,9 +39,13 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         self.full_dim_l1_weight = float(getattr(args, "full_dim_l1_weight", 0.0))
         self.orthogonal_weight = float(getattr(args, "orthogonal_weight", 0.01))
         self.orthogonal_pair_weights = self._parse_pair_weight_map(getattr(args, "orthogonal_pair_weights", ""))
-        self.cycle_weight = float(getattr(args, "adaptive_cycle_weight", 0.0))
+        self.residual_gate_weight = float(getattr(args, "residual_gate_weight", 0.1))
+        self.residual_orth_weight = float(getattr(args, "residual_orth_weight", 0.01))
+        self.residual_entropy_weight = float(getattr(args, "residual_entropy_weight", 0.001))
         self.projection_weights = self._parse_pair_weight_map(getattr(args, "stage1_projection_weights", ""))
         self.dim_align_l1_weights = self._parse_dim_weight_map(getattr(args, "align_l1_weights", ""))
+        self.residual_gate_layers = nn.ModuleDict()
+        self.residual_to_small_layers = nn.ModuleDict()
 
         if dist.is_initialized():
             self.world_size = dist.get_world_size()
@@ -124,106 +128,69 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             valid_dims.append(full_dim)
         return sorted(set(valid_dims))
 
-    def _resolve_image_token_ids(self, model_backbone: Optional[str]) -> List[int]:
-        # Backbone-dependent image placeholder ids in this repo.
-        mapping = {
-            "llava_next": [32000],
-            "llava_onevision": [151646],
-            "llava_qwen2": [32000],
-            "qwen2_vl": [151655],
-            "qwen2_5_vl": [151655],
-            "qwen2_vl_tokenselection": [151655],
-            "qwen2_5_vl_tokenselection": [151655],
-            "qwen3_vl": [151655],
-            "idefics3": [128257],  # SmolVLM "<image>"
-        }
-        return mapping.get(str(model_backbone), [151655, 32000, 151646])
+    def _is_adjacent_pair(self, src_dim: int, dst_dim: int, valid_dims: List[int]) -> bool:
+        if src_dim <= dst_dim:
+            return False
+        return not any(src_dim > mid > dst_dim for mid in valid_dims)
 
-    def _extract_text_vision_masks(
+    def _ensure_residual_modules(
         self,
-        input_ids: Tensor,
-        attention_mask: Tensor,
-        model_backbone: Optional[str],
-    ) -> Tuple[Tensor, Tensor]:
-        image_token_ids = self._resolve_image_token_ids(model_backbone)
-        valid_mask = attention_mask.bool()
-        vision_mask = torch.zeros_like(valid_mask)
-        for token_id in image_token_ids:
-            vision_mask = vision_mask | (input_ids == token_id)
-        vision_mask = vision_mask & valid_mask
-        text_mask = valid_mask & (~vision_mask)
-        return text_mask, vision_mask
+        src_dim: int,
+        dst_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[nn.Linear, nn.Linear]:
+        key = f"{src_dim}_to_{dst_dim}"
+        res_dim = src_dim - dst_dim
+        if key not in self.residual_gate_layers:
+            self.residual_gate_layers[key] = nn.Linear(res_dim, res_dim, bias=True)
+            self.residual_to_small_layers[key] = nn.Linear(res_dim, dst_dim, bias=True)
+        gate_layer = self.residual_gate_layers[key].to(device=device, dtype=dtype)
+        map_layer = self.residual_to_small_layers[key].to(device=device, dtype=dtype)
+        return gate_layer, map_layer
 
-    def _cross_modal_cycle_loss(
+    def _residual_gating_losses(
         self,
-        hidden_state: Tensor,
-        input_ids: Tensor,
-        attention_mask: Tensor,
-        adjacent_pairs: List[Tuple[int, int]],
-        model_backbone: Optional[str],
-    ) -> Tensor:
-        seq_len = hidden_state.size(1)
-        if input_ids.size(1) != seq_len or attention_mask.size(1) != seq_len:
-            aligned_input_ids = []
-            aligned_attention_mask = []
-            for b in range(hidden_state.size(0)):
-                valid_tokens = input_ids[b][attention_mask[b].bool()]
-                take = min(valid_tokens.numel(), seq_len)
-                sample_ids = torch.zeros(seq_len, dtype=input_ids.dtype, device=input_ids.device)
-                sample_mask = torch.zeros(seq_len, dtype=attention_mask.dtype, device=attention_mask.device)
-                if take > 0:
-                    sample_ids[:take] = valid_tokens[:take]
-                    sample_mask[:take] = 1
-                aligned_input_ids.append(sample_ids)
-                aligned_attention_mask.append(sample_mask)
-            input_ids = torch.stack(aligned_input_ids, dim=0)
-            attention_mask = torch.stack(aligned_attention_mask, dim=0)
-
-        text_mask, vision_mask = self._extract_text_vision_masks(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            model_backbone=model_backbone,
+        qry_full: Tensor,
+        pos_full: Tensor,
+        src_dim: int,
+        dst_dim: int,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        gate_layer, map_layer = self._ensure_residual_modules(
+            src_dim=src_dim,
+            dst_dim=dst_dim,
+            device=qry_full.device,
+            dtype=qry_full.dtype,
         )
-        if not adjacent_pairs:
-            return torch.zeros((), device=hidden_state.device, dtype=hidden_state.dtype)
+        q_large = qry_full[:, :src_dim]
+        p_large = pos_full[:, :src_dim]
+        q_small = qry_full[:, :dst_dim]
+        p_small = pos_full[:, :dst_dim]
+        q_residual = qry_full[:, dst_dim:src_dim]
+        p_residual = pos_full[:, dst_dim:src_dim]
 
-        total_loss = torch.zeros((), device=hidden_state.device, dtype=hidden_state.dtype)
-        count = 0
-        for src_dim, dst_dim in adjacent_pairs:
-            hs_src = F.normalize(hidden_state[:, :, :src_dim], p=2, dim=-1)
-            hs_dst = F.normalize(hidden_state[:, :, :dst_dim], p=2, dim=-1)
+        g_q = torch.sigmoid(gate_layer(q_residual))
+        g_p = torch.sigmoid(gate_layer(p_residual))
+        q_rebuild = torch.cat([q_small, g_q * q_residual], dim=-1)
+        p_rebuild = torch.cat([p_small, g_p * p_residual], dim=-1)
 
-            sim_src = torch.matmul(hs_src, hs_src.transpose(1, 2)) / math.sqrt(float(max(src_dim, 1)))
-            sim_dst = torch.matmul(hs_dst, hs_dst.transpose(1, 2)) / math.sqrt(float(max(dst_dim, 1)))
+        logits_large = (F.normalize(q_large, p=2, dim=-1) @ F.normalize(p_large, p=2, dim=-1).t()) / self.temperature
+        logits_rebuild = (F.normalize(q_rebuild, p=2, dim=-1) @ F.normalize(p_rebuild, p=2, dim=-1).t()) / self.temperature
+        info_l1 = F.l1_loss(logits_large, logits_rebuild)
 
-            key_mask = attention_mask[:, None, :].bool()
-            sim_src = sim_src.masked_fill(~key_mask, -1e4)
-            sim_dst = sim_dst.masked_fill(~key_mask, -1e4)
+        q_proj = map_layer(q_residual)
+        p_proj = map_layer(p_residual)
+        q_small_n = F.normalize(q_small, p=2, dim=-1)
+        p_small_n = F.normalize(p_small, p=2, dim=-1)
+        q_proj_n = F.normalize(q_proj, p=2, dim=-1)
+        p_proj_n = F.normalize(p_proj, p=2, dim=-1)
+        orth_reg = 0.5 * (((q_proj_n * q_small_n) ** 2).mean() + ((p_proj_n * p_small_n) ** 2).mean())
 
-            attn_src = torch.softmax(sim_src, dim=-1)
-            attn_dst = torch.softmax(sim_dst, dim=-1)
-
-            for b in range(hidden_state.size(0)):
-                t_idx = text_mask[b].nonzero(as_tuple=False).squeeze(-1)
-                v_idx = vision_mask[b].nonzero(as_tuple=False).squeeze(-1)
-                if t_idx.numel() == 0 or v_idx.numel() == 0:
-                    continue
-                a_vt_src = attn_src[b].index_select(0, v_idx).index_select(1, t_idx)
-                a_tv_src = attn_src[b].index_select(0, t_idx).index_select(1, v_idx)
-                a_vt_dst = attn_dst[b].index_select(0, v_idx).index_select(1, t_idx)
-                a_tv_dst = attn_dst[b].index_select(0, t_idx).index_select(1, v_idx)
-
-                vtv_src = torch.matmul(a_vt_src, a_tv_src)
-                tvt_src = torch.matmul(a_tv_src, a_vt_src)
-                vtv_dst = torch.matmul(a_vt_dst, a_tv_dst)
-                tvt_dst = torch.matmul(a_tv_dst, a_vt_dst)
-
-                total_loss = total_loss + F.l1_loss(vtv_src, vtv_dst) + F.l1_loss(tvt_src, tvt_dst)
-                count += 1
-
-        if count == 0:
-            return torch.zeros((), device=hidden_state.device, dtype=hidden_state.dtype)
-        return total_loss / float(count)
+        eps = 1e-8
+        entropy_q = -(g_q.clamp(eps, 1 - eps) * torch.log(g_q.clamp(eps, 1 - eps)) + (1 - g_q).clamp(eps, 1 - eps) * torch.log((1 - g_q).clamp(eps, 1 - eps))).mean()
+        entropy_p = -(g_p.clamp(eps, 1 - eps) * torch.log(g_p.clamp(eps, 1 - eps)) + (1 - g_p).clamp(eps, 1 - eps) * torch.log((1 - g_p).clamp(eps, 1 - eps))).mean()
+        entropy_reg = 0.5 * (entropy_q + entropy_p)
+        return info_l1, orth_reg, entropy_reg
 
     def _parse_dim_weight_map(self, spec) -> Dict[int, float]:
         """
@@ -368,8 +335,17 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         qry_input = input_data["qry"]
         pos_input = input_data["pos"]
 
-        qry_output = model.encode_input(qry_input, output_hidden_states=True, output_attentions=False)
-        pos_output = model.encode_input(pos_input, output_hidden_states=True, output_attentions=False)
+        qry_output = model.encode_input(qry_input, output_hidden_states=False, output_attentions=False)
+        pos_output = model.encode_input(pos_input, output_hidden_states=False, output_attentions=False)
+
+        if isinstance(qry_output, tuple):
+            qry_full = qry_output[0]
+        else:
+            qry_full = qry_output
+        if isinstance(pos_output, tuple):
+            pos_full = pos_output[0]
+        else:
+            pos_full = pos_output
 
         if isinstance(qry_output, tuple):
             qry_full = qry_output[0]
@@ -417,6 +393,9 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         losses = []
         align_losses = []
         orth_losses = []
+        residual_info_losses = []
+        residual_orth_regs = []
+        residual_entropy_regs = []
         metrics: Dict[str, Tensor] = {}
 
         if not stage_pairs:
@@ -435,7 +414,9 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             metrics["contrastive_loss"] = weighted_align_loss.detach()
             metrics["align_loss"] = weighted_align_loss.detach()
             metrics["orthogonal_loss"] = torch.zeros_like(weighted_align_loss).detach()
-            metrics["cycle_loss"] = torch.zeros_like(weighted_align_loss).detach()
+            metrics["residual_info_l1_loss"] = torch.zeros_like(weighted_align_loss).detach()
+            metrics["residual_orth_reg"] = torch.zeros_like(weighted_align_loss).detach()
+            metrics["residual_entropy_reg"] = torch.zeros_like(weighted_align_loss).detach()
             return metrics
 
         for idx in selected_ids:
@@ -475,6 +456,21 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
                 projection_weight * weighted_align_loss
                 + self.orthogonal_weight * projection_weight * orth_loss
             )
+            residual_info_l1 = torch.zeros_like(weighted_align_loss)
+            residual_orth_reg = torch.zeros_like(weighted_align_loss)
+            residual_entropy_reg = torch.zeros_like(weighted_align_loss)
+            if self._is_adjacent_pair(teacher_dim, student_dim, valid_dims):
+                residual_info_l1, residual_orth_reg, residual_entropy_reg = self._residual_gating_losses(
+                    qry_full=qry_full,
+                    pos_full=pos_full,
+                    src_dim=teacher_dim,
+                    dst_dim=student_dim,
+                )
+                total = total + projection_weight * (
+                    self.residual_gate_weight * residual_info_l1
+                    + self.residual_orth_weight * residual_orth_reg
+                    + self.residual_entropy_weight * residual_entropy_reg
+                )
 
             metrics[f"align_ce_{teacher_dim}_to_{student_dim}"] = align_ce.detach()
             metrics[f"align_l1_{teacher_dim}_to_{student_dim}"] = align_l1.detach()
@@ -485,13 +481,22 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             )
             metrics[f"align_loss_{teacher_dim}_to_{student_dim}"] = weighted_align_loss.detach()
             metrics[f"orthogonal_loss_{teacher_dim}_to_{student_dim}"] = orth_loss.detach()
+            metrics[f"residual_info_l1_loss_{teacher_dim}_to_{student_dim}"] = residual_info_l1.detach()
+            metrics[f"residual_orth_reg_{teacher_dim}_to_{student_dim}"] = residual_orth_reg.detach()
+            metrics[f"residual_entropy_reg_{teacher_dim}_to_{student_dim}"] = residual_entropy_reg.detach()
             losses.append(total)
             align_losses.append(weighted_align_loss)
             orth_losses.append(orth_loss)
+            residual_info_losses.append(residual_info_l1)
+            residual_orth_regs.append(residual_orth_reg)
+            residual_entropy_regs.append(residual_entropy_reg)
 
         final_loss = torch.stack(losses).mean()
         mean_align_loss = torch.stack(align_losses).mean()
         mean_orth_loss = torch.stack(orth_losses).mean()
+        mean_residual_info = torch.stack(residual_info_losses).mean()
+        mean_residual_orth = torch.stack(residual_orth_regs).mean()
+        mean_residual_entropy = torch.stack(residual_entropy_regs).mean()
 
         cycle_loss = torch.zeros_like(final_loss)
         if (
@@ -525,7 +530,9 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         metrics["contrastive_loss"] = mean_align_loss
         metrics["align_loss"] = mean_align_loss.detach()
         metrics["orthogonal_loss"] = mean_orth_loss.detach()
-        metrics["cycle_loss"] = cycle_loss.detach()
+        metrics["residual_info_l1_loss"] = mean_residual_info.detach()
+        metrics["residual_orth_reg"] = mean_residual_orth.detach()
+        metrics["residual_entropy_reg"] = mean_residual_entropy.detach()
         return metrics
 
 
