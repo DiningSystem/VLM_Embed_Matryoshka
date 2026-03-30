@@ -17,6 +17,7 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
       1) CLIP-style cross-modal alignment on a chosen student prefix.
       2) Curriculum training across nested dimensions with trainable projections.
       3) Orthogonality regularization on each projection matrix (P^T P -> I).
+      4) Residual-gated adjacent-dimension consistency + residual regularizers.
 
     Supported prefix chain (default): [64, 128, 256, 512, 768, 1024].
     Curriculum stage pairs are built from:
@@ -37,8 +38,13 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         self.full_dim_l1_weight = float(getattr(args, "full_dim_l1_weight", 0.0))
         self.orthogonal_weight = float(getattr(args, "orthogonal_weight", 0.01))
         self.orthogonal_pair_weights = self._parse_pair_weight_map(getattr(args, "orthogonal_pair_weights", ""))
+        self.residual_gate_weight = float(getattr(args, "residual_gate_weight", 0.1))
+        self.residual_orth_weight = float(getattr(args, "residual_orth_weight", 0.01))
+        self.residual_entropy_weight = float(getattr(args, "residual_entropy_weight", 0.001))
         self.projection_weights = self._parse_pair_weight_map(getattr(args, "stage1_projection_weights", ""))
         self.dim_align_l1_weights = self._parse_dim_weight_map(getattr(args, "align_l1_weights", ""))
+        self.residual_gate_layers = nn.ModuleDict()
+        self.residual_to_small_layers = nn.ModuleDict()
 
         if dist.is_initialized():
             self.world_size = dist.get_world_size()
@@ -120,6 +126,70 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         if full_dim not in valid_dims:
             valid_dims.append(full_dim)
         return sorted(set(valid_dims))
+
+    def _is_adjacent_pair(self, src_dim: int, dst_dim: int, valid_dims: List[int]) -> bool:
+        if src_dim <= dst_dim:
+            return False
+        return not any(src_dim > mid > dst_dim for mid in valid_dims)
+
+    def _ensure_residual_modules(
+        self,
+        src_dim: int,
+        dst_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[nn.Linear, nn.Linear]:
+        key = f"{src_dim}_to_{dst_dim}"
+        res_dim = src_dim - dst_dim
+        if key not in self.residual_gate_layers:
+            self.residual_gate_layers[key] = nn.Linear(res_dim, res_dim, bias=True)
+            self.residual_to_small_layers[key] = nn.Linear(res_dim, dst_dim, bias=True)
+        gate_layer = self.residual_gate_layers[key].to(device=device, dtype=dtype)
+        map_layer = self.residual_to_small_layers[key].to(device=device, dtype=dtype)
+        return gate_layer, map_layer
+
+    def _residual_gating_losses(
+        self,
+        qry_full: Tensor,
+        pos_full: Tensor,
+        src_dim: int,
+        dst_dim: int,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        gate_layer, map_layer = self._ensure_residual_modules(
+            src_dim=src_dim,
+            dst_dim=dst_dim,
+            device=qry_full.device,
+            dtype=qry_full.dtype,
+        )
+        q_large = qry_full[:, :src_dim]
+        p_large = pos_full[:, :src_dim]
+        q_small = qry_full[:, :dst_dim]
+        p_small = pos_full[:, :dst_dim]
+        q_residual = qry_full[:, dst_dim:src_dim]
+        p_residual = pos_full[:, dst_dim:src_dim]
+
+        g_q = torch.sigmoid(gate_layer(q_residual))
+        g_p = torch.sigmoid(gate_layer(p_residual))
+        q_rebuild = torch.cat([q_small, g_q * q_residual], dim=-1)
+        p_rebuild = torch.cat([p_small, g_p * p_residual], dim=-1)
+
+        logits_large = (F.normalize(q_large, p=2, dim=-1) @ F.normalize(p_large, p=2, dim=-1).t()) / self.temperature
+        logits_rebuild = (F.normalize(q_rebuild, p=2, dim=-1) @ F.normalize(p_rebuild, p=2, dim=-1).t()) / self.temperature
+        info_l1 = F.l1_loss(logits_large, logits_rebuild)
+
+        q_proj = map_layer(q_residual)
+        p_proj = map_layer(p_residual)
+        q_small_n = F.normalize(q_small, p=2, dim=-1)
+        p_small_n = F.normalize(p_small, p=2, dim=-1)
+        q_proj_n = F.normalize(q_proj, p=2, dim=-1)
+        p_proj_n = F.normalize(p_proj, p=2, dim=-1)
+        orth_reg = 0.5 * (((q_proj_n * q_small_n) ** 2).mean() + ((p_proj_n * p_small_n) ** 2).mean())
+
+        eps = 1e-8
+        entropy_q = -(g_q.clamp(eps, 1 - eps) * torch.log(g_q.clamp(eps, 1 - eps)) + (1 - g_q).clamp(eps, 1 - eps) * torch.log((1 - g_q).clamp(eps, 1 - eps))).mean()
+        entropy_p = -(g_p.clamp(eps, 1 - eps) * torch.log(g_p.clamp(eps, 1 - eps)) + (1 - g_p).clamp(eps, 1 - eps) * torch.log((1 - g_p).clamp(eps, 1 - eps))).mean()
+        entropy_reg = 0.5 * (entropy_q + entropy_p)
+        return info_l1, orth_reg, entropy_reg
 
     def _parse_dim_weight_map(self, spec) -> Dict[int, float]:
         """
@@ -264,8 +334,17 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         qry_input = input_data["qry"]
         pos_input = input_data["pos"]
 
-        qry_full = model.encode_input(qry_input)[0]
-        pos_full = model.encode_input(pos_input)[0]
+        qry_output = model.encode_input(qry_input, output_hidden_states=False, output_attentions=False)
+        pos_output = model.encode_input(pos_input, output_hidden_states=False, output_attentions=False)
+
+        if isinstance(qry_output, tuple):
+            qry_full = qry_output[0]
+        else:
+            qry_full = qry_output
+        if isinstance(pos_output, tuple):
+            pos_full = pos_output[0]
+        else:
+            pos_full = pos_output
 
         if self.world_size > 1:
             qry_full = self._dist_gather_tensor(qry_full)
@@ -299,6 +378,9 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         losses = []
         align_losses = []
         orth_losses = []
+        residual_info_losses = []
+        residual_orth_regs = []
+        residual_entropy_regs = []
         metrics: Dict[str, Tensor] = {}
 
         if not stage_pairs:
@@ -317,6 +399,9 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             metrics["contrastive_loss"] = weighted_align_loss.detach()
             metrics["align_loss"] = weighted_align_loss.detach()
             metrics["orthogonal_loss"] = torch.zeros_like(weighted_align_loss).detach()
+            metrics["residual_info_l1_loss"] = torch.zeros_like(weighted_align_loss).detach()
+            metrics["residual_orth_reg"] = torch.zeros_like(weighted_align_loss).detach()
+            metrics["residual_entropy_reg"] = torch.zeros_like(weighted_align_loss).detach()
             return metrics
 
         for idx in selected_ids:
@@ -352,7 +437,25 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
                 orth_pair_weight = 1.0
                 orth_loss = torch.zeros_like(weighted_align_loss)
 
-            total = projection_weight * weighted_align_loss + self.orthogonal_weight * projection_weight * orth_loss
+            total = (
+                projection_weight * weighted_align_loss
+                + self.orthogonal_weight * projection_weight * orth_loss
+            )
+            residual_info_l1 = torch.zeros_like(weighted_align_loss)
+            residual_orth_reg = torch.zeros_like(weighted_align_loss)
+            residual_entropy_reg = torch.zeros_like(weighted_align_loss)
+            if self._is_adjacent_pair(teacher_dim, student_dim, valid_dims):
+                residual_info_l1, residual_orth_reg, residual_entropy_reg = self._residual_gating_losses(
+                    qry_full=qry_full,
+                    pos_full=pos_full,
+                    src_dim=teacher_dim,
+                    dst_dim=student_dim,
+                )
+                total = total + projection_weight * (
+                    self.residual_gate_weight * residual_info_l1
+                    + self.residual_orth_weight * residual_orth_reg
+                    + self.residual_entropy_weight * residual_entropy_reg
+                )
 
             metrics[f"align_ce_{teacher_dim}_to_{student_dim}"] = align_ce.detach()
             metrics[f"align_l1_{teacher_dim}_to_{student_dim}"] = align_l1.detach()
@@ -363,13 +466,22 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             )
             metrics[f"align_loss_{teacher_dim}_to_{student_dim}"] = weighted_align_loss.detach()
             metrics[f"orthogonal_loss_{teacher_dim}_to_{student_dim}"] = orth_loss.detach()
+            metrics[f"residual_info_l1_loss_{teacher_dim}_to_{student_dim}"] = residual_info_l1.detach()
+            metrics[f"residual_orth_reg_{teacher_dim}_to_{student_dim}"] = residual_orth_reg.detach()
+            metrics[f"residual_entropy_reg_{teacher_dim}_to_{student_dim}"] = residual_entropy_reg.detach()
             losses.append(total)
             align_losses.append(weighted_align_loss)
             orth_losses.append(orth_loss)
+            residual_info_losses.append(residual_info_l1)
+            residual_orth_regs.append(residual_orth_reg)
+            residual_entropy_regs.append(residual_entropy_reg)
 
         final_loss = torch.stack(losses).mean()
         mean_align_loss = torch.stack(align_losses).mean()
         mean_orth_loss = torch.stack(orth_losses).mean()
+        mean_residual_info = torch.stack(residual_info_losses).mean()
+        mean_residual_orth = torch.stack(residual_orth_regs).mean()
+        mean_residual_entropy = torch.stack(residual_entropy_regs).mean()
 
         # Keep `contrastive_loss` for compatibility with existing trainer logging.
         metrics["loss"] = final_loss
@@ -377,6 +489,9 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         metrics["contrastive_loss"] = mean_align_loss
         metrics["align_loss"] = mean_align_loss.detach()
         metrics["orthogonal_loss"] = mean_orth_loss.detach()
+        metrics["residual_info_l1_loss"] = mean_residual_info.detach()
+        metrics["residual_orth_reg"] = mean_residual_orth.detach()
+        metrics["residual_entropy_reg"] = mean_residual_entropy.detach()
         return metrics
 
 
