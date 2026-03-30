@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -346,9 +347,23 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         else:
             pos_full = pos_output
 
+        if isinstance(qry_output, tuple):
+            qry_full = qry_output[0]
+            qry_hidden_states = qry_output[3] if len(qry_output) > 3 else None
+        else:
+            qry_full = qry_output
+            qry_hidden_states = None
+        if isinstance(pos_output, tuple):
+            pos_full = pos_output[0]
+        else:
+            pos_full = pos_output
+
+        qry_last_hidden = qry_hidden_states[-1] if qry_hidden_states is not None else None
         if self.world_size > 1:
             qry_full = self._dist_gather_tensor(qry_full)
             pos_full = self._dist_gather_tensor(pos_full)
+            if qry_last_hidden is not None:
+                qry_last_hidden = self._dist_gather_tensor(qry_last_hidden)
 
         full_dim = qry_full.size(-1)
         valid_dims = self._resolve_dims(full_dim)
@@ -482,6 +497,32 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         mean_residual_info = torch.stack(residual_info_losses).mean()
         mean_residual_orth = torch.stack(residual_orth_regs).mean()
         mean_residual_entropy = torch.stack(residual_entropy_regs).mean()
+
+        cycle_loss = torch.zeros_like(final_loss)
+        if (
+            self.cycle_weight > 0.0
+            and qry_last_hidden is not None
+            and "input_ids" in qry_input
+            and "attention_mask" in qry_input
+        ):
+            qry_input_ids = qry_input["input_ids"]
+            qry_attn_mask = qry_input["attention_mask"]
+            if self.world_size > 1:
+                qry_input_ids = self._dist_gather_tensor(qry_input_ids)
+                qry_attn_mask = self._dist_gather_tensor(qry_attn_mask)
+            adjacent_pairs = []
+            for src_dim, dst_dim in stage_pairs:
+                if src_dim > dst_dim and not any(src_dim > mid > dst_dim for mid in valid_dims):
+                    adjacent_pairs.append((src_dim, dst_dim))
+            adjacent_pairs = list(dict.fromkeys(adjacent_pairs))
+            cycle_loss = self._cross_modal_cycle_loss(
+                hidden_state=qry_last_hidden,
+                input_ids=qry_input_ids,
+                attention_mask=qry_attn_mask,
+                adjacent_pairs=adjacent_pairs,
+                model_backbone=getattr(model, "model_backbone", None),
+            )
+            final_loss = final_loss + self.cycle_weight * cycle_loss
 
         # Keep `contrastive_loss` for compatibility with existing trainer logging.
         metrics["loss"] = final_loss
