@@ -37,7 +37,7 @@ torchrun \
     --stage1_projection_weights "896->768:1.0,768->512:1.0,512->256:1.0,256->128:1.0,128->64:1.0" \
     --align_l1_weight 1.0 \
     --full_dim_l1_weight 0.0 \
-    --align_l1_weights "64:0.6,128:0.6,256:0.6,512:0.6,768:0.6" \
+    --align_l1_weights "64:0.8,128:0.8,256:0.6,512:0.4,768:0.4" \
     --orthogonal_weight 0.01 \
     --residual_gate_weight 0.2 \
     --residual_orth_weight 0.01 \
