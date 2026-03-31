@@ -66,7 +66,7 @@ Use comma-separated pairs, each pair must be `larger_dim->smaller_dim` (or `larg
 
 This allows multiple larger dims projecting to the same smaller dim (for example both `2048->512` and `1024->512`).
 
-If `--stage1_projection_spec ""` (empty), training defaults to **all valid larger->smaller pairs** from `--nested_dims` plus the model full dim.
+If `--stage1_projection_spec ""` (empty), training defaults to **adjacent larger->smaller pairs only** from `--nested_dims` plus the model full dim.
 
 #### 2) Per-edge weight format
 
