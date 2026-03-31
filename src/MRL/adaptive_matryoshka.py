@@ -498,32 +498,6 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         mean_residual_orth = torch.stack(residual_orth_regs).mean()
         mean_residual_entropy = torch.stack(residual_entropy_regs).mean()
 
-        cycle_loss = torch.zeros_like(final_loss)
-        if (
-            self.cycle_weight > 0.0
-            and qry_last_hidden is not None
-            and "input_ids" in qry_input
-            and "attention_mask" in qry_input
-        ):
-            qry_input_ids = qry_input["input_ids"]
-            qry_attn_mask = qry_input["attention_mask"]
-            if self.world_size > 1:
-                qry_input_ids = self._dist_gather_tensor(qry_input_ids)
-                qry_attn_mask = self._dist_gather_tensor(qry_attn_mask)
-            adjacent_pairs = []
-            for src_dim, dst_dim in stage_pairs:
-                if src_dim > dst_dim and not any(src_dim > mid > dst_dim for mid in valid_dims):
-                    adjacent_pairs.append((src_dim, dst_dim))
-            adjacent_pairs = list(dict.fromkeys(adjacent_pairs))
-            cycle_loss = self._cross_modal_cycle_loss(
-                hidden_state=qry_last_hidden,
-                input_ids=qry_input_ids,
-                attention_mask=qry_attn_mask,
-                adjacent_pairs=adjacent_pairs,
-                model_backbone=getattr(model, "model_backbone", None),
-            )
-            final_loss = final_loss + self.cycle_weight * cycle_loss
-
         # Keep `contrastive_loss` for compatibility with existing trainer logging.
         metrics["loss"] = final_loss
         metrics["total_loss"] = final_loss.detach()
