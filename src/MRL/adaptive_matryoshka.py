@@ -452,9 +452,12 @@ class PairwiseProjectionBank(nn.Module):
     def __init__(self, dimension_pairs: List[Tuple[int, int]]):
         super().__init__()
         self.projections = nn.ParameterDict()
+        self.residual_gates = nn.ParameterDict()
         for src_dim, dst_dim in dimension_pairs:
             key = self._key(src_dim, dst_dim)
             self.projections[key] = nn.Parameter(self._init_projection(src_dim, dst_dim))
+            if src_dim > dst_dim:
+                self.residual_gates[key] = nn.Parameter(torch.zeros(src_dim - dst_dim, dtype=torch.float32))
 
     @staticmethod
     def _key(src_dim: int, dst_dim: int) -> str:
@@ -475,6 +478,13 @@ class PairwiseProjectionBank(nn.Module):
         if key not in self.projections:
             raise KeyError(f"Missing projection matrix for {src_dim}->{dst_dim}.")
         return x @ self.projections[key]
+
+    def residual_gate(self, src_dim: int, dst_dim: int, device: torch.device, dtype: torch.dtype) -> Optional[Tensor]:
+        key = self._key(src_dim, dst_dim)
+        if key not in self.residual_gates:
+            return None
+        gate = torch.sigmoid(self.residual_gates[key])
+        return gate.to(device=device, dtype=dtype).unsqueeze(0)
 
     def orthogonality_loss(self, src_dim: int, dst_dim: int) -> Tensor:
         if src_dim == dst_dim:
