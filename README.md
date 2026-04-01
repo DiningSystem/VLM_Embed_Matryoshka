@@ -87,10 +87,12 @@ Likewise, if an edge is not listed in `--orthogonal_pair_weights`, that edge use
 --stage1_phase all \
 --stage1_projection_spec "2048->1024,2048->512,1024->512,1024->256,512->256,256->128,128->64" \
 --stage1_projection_weights "2048->1024:1.0,2048->512:0.8,1024->512:1.0,1024->256:0.8,512->256:1.0,256->128:1.0,128->64:1.0" \
---orthogonal_weight 0.01
+--orthogonal_weight 0.01 \
+--spectrum_kl_weight 0.1
 ```
 
 Orthogonality regularization is still applied per active projection edge.
+You can additionally regularize adjacent-dimensional spectral consistency using `--spectrum_kl_weight` (SVD spectrum KL), computed separately for query and positive batches and then averaged.
 
 ## Inference & Evaluation
 1. To evaluate our model on an MMEB dataset (e.g., MSCOCO_i2t), run:

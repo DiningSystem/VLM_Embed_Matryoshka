@@ -158,33 +158,9 @@ class TrainingArguments(TrainingArguments):
         default="",
         metadata={"help": "Optional per-projection orthogonality weights. Format: '1024->512:1.0,512->256:0.7' (or '1024:512:1.0')."},
     )
-    residual_gate_weight: float = field(
+    spectrum_kl_weight: float = field(
         default=0.0,
-        metadata={"help": "Weight of residual-gated adjacent-dimension InfoNCE-logit L1 term in Adaptive Matryoshka Stage-1."},
-    )
-    residual_orth_weight: float = field(
-        default=0.0,
-        metadata={"help": "Weight of residual-to-small orthogonality regularizer in Adaptive Matryoshka Stage-1."},
-    )
-    residual_entropy_weight: float = field(
-        default=0.0,
-        metadata={"help": "Weight of entropy regularizer on residual gating coefficients in Adaptive Matryoshka Stage-1."},
-    )
-    cycle_weight: float = field(
-        default=0.0,
-        metadata={"help": "[Deprecated/no-op] Kept for backward compatibility with old training commands that still pass --cycle_weight."},
-    )
-    router_alpha: float = field(
-        default=0.01,
-        metadata={"help": "Compute penalty weight for Adaptive Matryoshka Stage-2 router training."},
-    )
-    router_hidden_dim: int = field(
-        default=256,
-        metadata={"help": "Hidden size of the MLP router for adaptive dimension prediction."},
-    )
-    router_accuracy_threshold: float = field(
-        default=0.9,
-        metadata={"help": "Minimum retrieval score/accuracy threshold used to build router labels."},
+        metadata={"help": "Weight of SVD-spectrum KL consistency loss between adjacent dimensions in Adaptive Matryoshka Stage-1."},
     )
 @dataclass
 class MTEBArguments:
