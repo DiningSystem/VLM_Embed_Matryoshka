@@ -39,6 +39,4 @@ torchrun \
     --full_dim_l1_weight 0.0 \
     --align_l1_weights "64:0.8,128:0.8,256:0.6,512:0.4,768:0.4" \
     --orthogonal_weight 0.01 \
-    --residual_gate_weight 0.2 \
-    --residual_orth_weight 0.01 \
-    --residual_entropy_weight 0.001
+    --spectrum_kl_weight 0.1
