@@ -192,9 +192,15 @@ class Trainer:
         self.model_args = model_args
         self.training_args = training_args
         
-        self.trainer = DDP(self.trainer, 
-                             device_ids=[self.gpu_id],
-                             find_unused_parameters=False)
+        find_unused_parameters = bool(getattr(self.training_args, "ddp_find_unused_parameters", False))
+        if getattr(self.training_args, "kd_loss_type", "") == "adaptive_mrl_stage1":
+            find_unused_parameters = True
+
+        self.trainer = DDP(
+            self.trainer,
+            device_ids=[self.gpu_id],
+            find_unused_parameters=find_unused_parameters,
+        )
     
     def _debug_batch_devices(self, obj, prefix=""):
         if obj is None:

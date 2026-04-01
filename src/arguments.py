@@ -83,6 +83,10 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments(TrainingArguments):
+    ddp_find_unused_parameters: bool = field(
+        default=False,
+        metadata={"help": "Pass find_unused_parameters to torch.nn.parallel.DistributedDataParallel. Auto-enabled for adaptive_mrl_stage1."},
+    )
     optimizer_name: str = field(
         default="adamw",
         metadata={"help": "Optimizer for train_ddp_one_model.py. Supported: adamw, moon (alias: muon, backed by torch.optim.Muon)."},
