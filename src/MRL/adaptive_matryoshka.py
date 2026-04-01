@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -18,12 +17,12 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
       1) CLIP-style cross-modal alignment on a chosen student prefix.
       2) Curriculum training across nested dimensions with trainable projections.
       3) Orthogonality regularization on each projection matrix (P^T P -> I).
-      4) Residual-gated adjacent-dimension consistency + residual regularizers.
+      4) Adjacent-dimension spectral consistency via SVD-spectrum KL.
 
     Supported prefix chain (default): [64, 128, 256, 512, 768, 1024].
     Curriculum stage pairs are built from:
       - explicit user projection graph (`stage1_projection_spec`), or
-      - all larger->smaller valid pairs from configured dims.
+      - adjacent larger->smaller valid pairs from configured dims.
     Multiple larger dimensions can project into the same smaller dimension.
     """
 
@@ -35,17 +34,13 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         self.nested_dims = sorted(set(nested_dims))
         self.phase = str(getattr(args, "stage1_phase", "all")).upper()
         self.projection_spec = str(getattr(args, "stage1_projection_spec", "")).strip()
-        self.align_l1_weight = float(getattr(args, "align_l1_weight", 1.0))
+        self.align_l1_weight = float(getattr(args, "align_l1_weight", 0.0))
         self.full_dim_l1_weight = float(getattr(args, "full_dim_l1_weight", 0.0))
         self.orthogonal_weight = float(getattr(args, "orthogonal_weight", 0.01))
         self.orthogonal_pair_weights = self._parse_pair_weight_map(getattr(args, "orthogonal_pair_weights", ""))
-        self.residual_gate_weight = float(getattr(args, "residual_gate_weight", 0.1))
-        self.residual_orth_weight = float(getattr(args, "residual_orth_weight", 0.01))
-        self.residual_entropy_weight = float(getattr(args, "residual_entropy_weight", 0.001))
+        self.spectrum_kl_weight = float(getattr(args, "spectrum_kl_weight", 0.0))
         self.projection_weights = self._parse_pair_weight_map(getattr(args, "stage1_projection_weights", ""))
         self.dim_align_l1_weights = self._parse_dim_weight_map(getattr(args, "align_l1_weights", ""))
-        self.residual_gate_layers = nn.ModuleDict()
-        self.residual_to_small_layers = nn.ModuleDict()
 
         if dist.is_initialized():
             self.world_size = dist.get_world_size()
@@ -128,69 +123,44 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             valid_dims.append(full_dim)
         return sorted(set(valid_dims))
 
-    def _is_adjacent_pair(self, src_dim: int, dst_dim: int, valid_dims: List[int]) -> bool:
-        if src_dim <= dst_dim:
-            return False
-        return not any(src_dim > mid > dst_dim for mid in valid_dims)
-
-    def _ensure_residual_modules(
-        self,
-        src_dim: int,
-        dst_dim: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tuple[nn.Linear, nn.Linear]:
-        key = f"{src_dim}_to_{dst_dim}"
-        res_dim = src_dim - dst_dim
-        if key not in self.residual_gate_layers:
-            self.residual_gate_layers[key] = nn.Linear(res_dim, res_dim, bias=True)
-            self.residual_to_small_layers[key] = nn.Linear(res_dim, dst_dim, bias=True)
-        gate_layer = self.residual_gate_layers[key].to(device=device, dtype=dtype)
-        map_layer = self.residual_to_small_layers[key].to(device=device, dtype=dtype)
-        return gate_layer, map_layer
-
-    def _residual_gating_losses(
-        self,
-        qry_full: Tensor,
-        pos_full: Tensor,
-        src_dim: int,
-        dst_dim: int,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
-        gate_layer, map_layer = self._ensure_residual_modules(
-            src_dim=src_dim,
-            dst_dim=dst_dim,
-            device=qry_full.device,
-            dtype=qry_full.dtype,
-        )
-        q_large = qry_full[:, :src_dim]
-        p_large = pos_full[:, :src_dim]
-        q_small = qry_full[:, :dst_dim]
-        p_small = pos_full[:, :dst_dim]
-        q_residual = qry_full[:, dst_dim:src_dim]
-        p_residual = pos_full[:, dst_dim:src_dim]
-
-        g_q = torch.sigmoid(gate_layer(q_residual))
-        g_p = torch.sigmoid(gate_layer(p_residual))
-        q_rebuild = torch.cat([q_small, g_q * q_residual], dim=-1)
-        p_rebuild = torch.cat([p_small, g_p * p_residual], dim=-1)
-
-        logits_large = (F.normalize(q_large, p=2, dim=-1) @ F.normalize(p_large, p=2, dim=-1).t()) / self.temperature
-        logits_rebuild = (F.normalize(q_rebuild, p=2, dim=-1) @ F.normalize(p_rebuild, p=2, dim=-1).t()) / self.temperature
-        info_l1 = F.l1_loss(logits_large, logits_rebuild)
-
-        q_proj = map_layer(q_residual)
-        p_proj = map_layer(p_residual)
-        q_small_n = F.normalize(q_small, p=2, dim=-1)
-        p_small_n = F.normalize(p_small, p=2, dim=-1)
-        q_proj_n = F.normalize(q_proj, p=2, dim=-1)
-        p_proj_n = F.normalize(p_proj, p=2, dim=-1)
-        orth_reg = 0.5 * (((q_proj_n * q_small_n) ** 2).mean() + ((p_proj_n * p_small_n) ** 2).mean())
-
+    def _adjacent_spectrum_kl(self, qry_full: Tensor, pos_full: Tensor, valid_dims: List[int]) -> Tuple[Tensor, Dict[str, Tensor]]:
         eps = 1e-8
-        entropy_q = -(g_q.clamp(eps, 1 - eps) * torch.log(g_q.clamp(eps, 1 - eps)) + (1 - g_q).clamp(eps, 1 - eps) * torch.log((1 - g_q).clamp(eps, 1 - eps))).mean()
-        entropy_p = -(g_p.clamp(eps, 1 - eps) * torch.log(g_p.clamp(eps, 1 - eps)) + (1 - g_p).clamp(eps, 1 - eps) * torch.log((1 - g_p).clamp(eps, 1 - eps))).mean()
-        entropy_reg = 0.5 * (entropy_q + entropy_p)
-        return info_l1, orth_reg, entropy_reg
+        device = qry_full.device
+        sorted_dims = sorted(set(valid_dims), reverse=True)
+        adjacent_pairs = [(sorted_dims[i], sorted_dims[i + 1]) for i in range(len(sorted_dims) - 1)]
+        if not adjacent_pairs:
+            z = torch.zeros((), device=device, dtype=qry_full.dtype)
+            return z, {}
+
+        def _symmetric_kl_from_svals(x_src: Tensor, x_dst: Tensor) -> Tensor:
+            s_src = torch.linalg.svdvals(x_src.float())
+            s_dst = torch.linalg.svdvals(x_dst.float())
+            k = min(s_src.numel(), s_dst.numel())
+            p = (s_src[:k] + eps) / (s_src[:k].sum() + eps * k)
+            q = (s_dst[:k] + eps) / (s_dst[:k].sum() + eps * k)
+            kl_pq = (p * (torch.log(p) - torch.log(q))).sum()
+            kl_qp = (q * (torch.log(q) - torch.log(p))).sum()
+            return 0.5 * (kl_pq + kl_qp)
+
+        losses: List[Tensor] = []
+        aux: Dict[str, Tensor] = {}
+        for src_dim, dst_dim in adjacent_pairs:
+            q_src, q_dst = qry_full[:, :src_dim], qry_full[:, :dst_dim]
+            p_src, p_dst = pos_full[:, :src_dim], pos_full[:, :dst_dim]
+
+            q_loss = _symmetric_kl_from_svals(q_src, q_dst)
+            p_loss = _symmetric_kl_from_svals(p_src, p_dst)
+            loss_pair = 0.5 * (q_loss + p_loss)
+            losses.append(loss_pair.to(dtype=qry_full.dtype))
+
+            aux[f"spectrum_rank_qry_{src_dim}"] = torch.linalg.matrix_rank(q_src.float()).to(dtype=qry_full.dtype).detach()
+            aux[f"spectrum_rank_qry_{dst_dim}"] = torch.linalg.matrix_rank(q_dst.float()).to(dtype=qry_full.dtype).detach()
+            aux[f"spectrum_rank_pos_{src_dim}"] = torch.linalg.matrix_rank(p_src.float()).to(dtype=qry_full.dtype).detach()
+            aux[f"spectrum_rank_pos_{dst_dim}"] = torch.linalg.matrix_rank(p_dst.float()).to(dtype=qry_full.dtype).detach()
+            aux[f"spectrum_kl_qry_{src_dim}_to_{dst_dim}"] = q_loss.detach()
+            aux[f"spectrum_kl_pos_{src_dim}_to_{dst_dim}"] = p_loss.detach()
+            aux[f"spectrum_kl_{src_dim}_to_{dst_dim}"] = loss_pair.detach()
+        return torch.stack(losses).mean(), aux
 
     def _parse_dim_weight_map(self, spec) -> Dict[int, float]:
         """
@@ -346,24 +316,9 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             pos_full = pos_output[0]
         else:
             pos_full = pos_output
-
-        if isinstance(qry_output, tuple):
-            qry_full = qry_output[0]
-            qry_hidden_states = qry_output[3] if len(qry_output) > 3 else None
-        else:
-            qry_full = qry_output
-            qry_hidden_states = None
-        if isinstance(pos_output, tuple):
-            pos_full = pos_output[0]
-        else:
-            pos_full = pos_output
-
-        qry_last_hidden = qry_hidden_states[-1] if qry_hidden_states is not None else None
         if self.world_size > 1:
             qry_full = self._dist_gather_tensor(qry_full)
             pos_full = self._dist_gather_tensor(pos_full)
-            if qry_last_hidden is not None:
-                qry_last_hidden = self._dist_gather_tensor(qry_last_hidden)
 
         full_dim = qry_full.size(-1)
         valid_dims = self._resolve_dims(full_dim)
@@ -380,11 +335,14 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
                 if src_dim in valid_dim_set and dst_dim in valid_dim_set
             ]
         else:
-            # Default: all valid larger->smaller pairs.
-            for src_dim in desc_dims:
-                for dst_dim in desc_dims:
-                    if src_dim > dst_dim:
-                        stage_pairs.append((src_dim, dst_dim))
+            # Default: adjacent larger->smaller pairs only (stable baseline).
+            # For dims [1024, 768, 512, 256], this yields:
+            #   1024->768, 768->512, 512->256
+            for i in range(len(desc_dims) - 1):
+                src_dim = desc_dims[i]
+                dst_dim = desc_dims[i + 1]
+                if src_dim > dst_dim:
+                    stage_pairs.append((src_dim, dst_dim))
         # remove duplicates while preserving order
         stage_pairs = list(dict.fromkeys(stage_pairs))
 
@@ -393,31 +351,30 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         losses = []
         align_losses = []
         orth_losses = []
-        residual_info_losses = []
-        residual_orth_regs = []
-        residual_entropy_regs = []
         metrics: Dict[str, Tensor] = {}
 
-        if not stage_pairs:
-            # Single-dimension fallback (no projection pair available).
-            align_ce, align_l1, _ = self._cross_alignment_l1(
-                model=model,
-                qry=qry_full,
-                pos=pos_full,
-                target=target,
-                dim=desc_dims[0],
-                bigger_dim=desc_dims[0],
-            )
-            weighted_align_loss = align_ce + self.full_dim_l1_weight * align_l1
-            metrics["loss"] = weighted_align_loss
-            metrics["total_loss"] = weighted_align_loss.detach()
-            metrics["contrastive_loss"] = weighted_align_loss.detach()
-            metrics["align_loss"] = weighted_align_loss.detach()
-            metrics["orthogonal_loss"] = torch.zeros_like(weighted_align_loss).detach()
-            metrics["residual_info_l1_loss"] = torch.zeros_like(weighted_align_loss).detach()
-            metrics["residual_orth_reg"] = torch.zeros_like(weighted_align_loss).detach()
-            metrics["residual_entropy_reg"] = torch.zeros_like(weighted_align_loss).detach()
-            return metrics
+        # Always keep a full-dimension anchor objective so projected stages do not
+        # drift away from the base retrieval representation.
+        full_dim = desc_dims[0]
+        full_align_ce, full_align_l1, _ = self._cross_alignment_l1(
+            model=model,
+            qry=qry_full,
+            pos=pos_full,
+            target=target,
+            dim=full_dim,
+            bigger_dim=full_dim,
+        )
+        full_align_loss = full_align_ce + self.full_dim_l1_weight * full_align_l1
+        losses.append(full_align_loss)
+        align_losses.append(full_align_loss)
+        orth_losses.append(torch.zeros_like(full_align_loss))
+        metrics[f"align_ce_{full_dim}_to_{full_dim}"] = full_align_ce.detach()
+        metrics[f"align_l1_{full_dim}_to_{full_dim}"] = full_align_l1.detach()
+        metrics[f"align_l1_weight_{full_dim}_to_{full_dim}"] = torch.tensor(self.full_dim_l1_weight, device=full_align_ce.device)
+        metrics[f"projection_weight_{full_dim}_to_{full_dim}"] = torch.tensor(1.0, device=full_align_ce.device)
+        metrics[f"orthogonal_pair_weight_{full_dim}_to_{full_dim}"] = torch.tensor(0.0, device=full_align_ce.device)
+        metrics[f"align_loss_{full_dim}_to_{full_dim}"] = full_align_loss.detach()
+        metrics[f"orthogonal_loss_{full_dim}_to_{full_dim}"] = torch.zeros_like(full_align_loss).detach()
 
         for idx in selected_ids:
             teacher_dim, student_dim = stage_pairs[idx]
@@ -456,22 +413,6 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
                 projection_weight * weighted_align_loss
                 + self.orthogonal_weight * projection_weight * orth_loss
             )
-            residual_info_l1 = torch.zeros_like(weighted_align_loss)
-            residual_orth_reg = torch.zeros_like(weighted_align_loss)
-            residual_entropy_reg = torch.zeros_like(weighted_align_loss)
-            if self._is_adjacent_pair(teacher_dim, student_dim, valid_dims):
-                residual_info_l1, residual_orth_reg, residual_entropy_reg = self._residual_gating_losses(
-                    qry_full=qry_full,
-                    pos_full=pos_full,
-                    src_dim=teacher_dim,
-                    dst_dim=student_dim,
-                )
-                total = total + projection_weight * (
-                    self.residual_gate_weight * residual_info_l1
-                    + self.residual_orth_weight * residual_orth_reg
-                    + self.residual_entropy_weight * residual_entropy_reg
-                )
-
             metrics[f"align_ce_{teacher_dim}_to_{student_dim}"] = align_ce.detach()
             metrics[f"align_l1_{teacher_dim}_to_{student_dim}"] = align_l1.detach()
             metrics[f"align_l1_weight_{teacher_dim}_to_{student_dim}"] = torch.tensor(l1_weight, device=align_ce.device)
@@ -481,48 +422,20 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             )
             metrics[f"align_loss_{teacher_dim}_to_{student_dim}"] = weighted_align_loss.detach()
             metrics[f"orthogonal_loss_{teacher_dim}_to_{student_dim}"] = orth_loss.detach()
-            metrics[f"residual_info_l1_loss_{teacher_dim}_to_{student_dim}"] = residual_info_l1.detach()
-            metrics[f"residual_orth_reg_{teacher_dim}_to_{student_dim}"] = residual_orth_reg.detach()
-            metrics[f"residual_entropy_reg_{teacher_dim}_to_{student_dim}"] = residual_entropy_reg.detach()
             losses.append(total)
             align_losses.append(weighted_align_loss)
             orth_losses.append(orth_loss)
-            residual_info_losses.append(residual_info_l1)
-            residual_orth_regs.append(residual_orth_reg)
-            residual_entropy_regs.append(residual_entropy_reg)
 
-        final_loss = torch.stack(losses).mean()
+        spectrum_kl, spectrum_metrics = self._adjacent_spectrum_kl(qry_full=qry_full, pos_full=pos_full, valid_dims=valid_dims)
+        metrics.update(spectrum_metrics)
+        if self.spectrum_kl_weight > 0.0:
+            final_loss = torch.stack(losses).mean() + self.spectrum_kl_weight * spectrum_kl
+        else:
+            final_loss = torch.stack(losses).mean()
+        metrics["spectrum_kl_loss"] = spectrum_kl.detach()
+
         mean_align_loss = torch.stack(align_losses).mean()
         mean_orth_loss = torch.stack(orth_losses).mean()
-        mean_residual_info = torch.stack(residual_info_losses).mean()
-        mean_residual_orth = torch.stack(residual_orth_regs).mean()
-        mean_residual_entropy = torch.stack(residual_entropy_regs).mean()
-
-        cycle_loss = torch.zeros_like(final_loss)
-        if (
-            self.cycle_weight > 0.0
-            and qry_last_hidden is not None
-            and "input_ids" in qry_input
-            and "attention_mask" in qry_input
-        ):
-            qry_input_ids = qry_input["input_ids"]
-            qry_attn_mask = qry_input["attention_mask"]
-            if self.world_size > 1:
-                qry_input_ids = self._dist_gather_tensor(qry_input_ids)
-                qry_attn_mask = self._dist_gather_tensor(qry_attn_mask)
-            adjacent_pairs = []
-            for src_dim, dst_dim in stage_pairs:
-                if src_dim > dst_dim and not any(src_dim > mid > dst_dim for mid in valid_dims):
-                    adjacent_pairs.append((src_dim, dst_dim))
-            adjacent_pairs = list(dict.fromkeys(adjacent_pairs))
-            cycle_loss = self._cross_modal_cycle_loss(
-                hidden_state=qry_last_hidden,
-                input_ids=qry_input_ids,
-                attention_mask=qry_attn_mask,
-                adjacent_pairs=adjacent_pairs,
-                model_backbone=getattr(model, "model_backbone", None),
-            )
-            final_loss = final_loss + self.cycle_weight * cycle_loss
 
         # Keep `contrastive_loss` for compatibility with existing trainer logging.
         metrics["loss"] = final_loss
@@ -530,9 +443,6 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
         metrics["contrastive_loss"] = mean_align_loss
         metrics["align_loss"] = mean_align_loss.detach()
         metrics["orthogonal_loss"] = mean_orth_loss.detach()
-        metrics["residual_info_l1_loss"] = mean_residual_info.detach()
-        metrics["residual_orth_reg"] = mean_residual_orth.detach()
-        metrics["residual_entropy_reg"] = mean_residual_entropy.detach()
         return metrics
 
 
@@ -576,121 +486,3 @@ class PairwiseProjectionBank(nn.Module):
         gram = p.transpose(0, 1) @ p
         eye = torch.eye(dst_dim, device=p.device, dtype=p.dtype)
         return ((gram - eye) ** 2).mean()
-
-
-class AdaptiveDimensionRouter(nn.Module):
-    """
-    Router MLP for Stage-2 adaptive dimension selection.
-
-    Input  : query embedding (full dim).
-    Output : logits over dimension levels [64, 128, 256, 512, 768, 1024] (or configured dims).
-    """
-
-    def __init__(self, input_dim: int, dim_levels: List[int], hidden_dim: int = 256):
-        super().__init__()
-        self.dim_levels = sorted(dim_levels)
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, len(self.dim_levels)),
-        )
-
-    def forward(self, query_embedding: Tensor) -> Tensor:
-        return self.mlp(query_embedding)
-
-
-class AdaptiveRouterLoss(nn.Module):
-    """
-    Stage-2 loss for adaptive router training.
-
-    - Builds pseudo labels by measuring retrieval correctness at each prefix and
-      selecting the smallest dimension that reaches `router_accuracy_threshold`.
-    - Optimizes CE(router_logits, target_dim_id) + alpha * expected_dimension_cost.
-    """
-
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self.temperature = getattr(args, "temperature", 0.02)
-        self.dim_levels = sorted(getattr(args, "nested_dims", None) or [64, 128, 256, 512, 768, 1024])
-        self.alpha = float(getattr(args, "router_alpha", 0.01))
-        self.threshold = float(getattr(args, "router_accuracy_threshold", 0.9))
-        self.router_hidden_dim = int(getattr(args, "router_hidden_dim", 256))
-
-        if dist.is_initialized():
-            self.world_size = dist.get_world_size()
-            self.process_rank = dist.get_rank()
-        else:
-            self.world_size = 1
-            self.process_rank = 0
-
-    def _dist_gather_tensor(self, t: Tensor) -> Tensor:
-        t = t.contiguous()
-        all_tensors = [torch.empty_like(t) for _ in range(self.world_size)]
-        dist.all_gather(all_tensors, t)
-        all_tensors[self.process_rank] = t
-        return torch.cat(all_tensors, dim=0)
-
-    def _target_from_retrieval(self, q: Tensor, p: Tensor, target: Tensor) -> Tensor:
-        # For each query, choose the smallest dim whose top-1 retrieval is correct.
-        dim_levels = [d for d in self.dim_levels if d <= q.size(-1)]
-        costs = torch.tensor(dim_levels, dtype=q.dtype, device=q.device)
-
-        per_dim_correct = []
-        for dim in dim_levels:
-            qd = F.normalize(q[:, :dim], p=2, dim=-1)
-            pd = F.normalize(p[:, :dim], p=2, dim=-1)
-            logits = (qd @ pd.t()) / self.temperature
-            pred = logits.argmax(dim=-1)
-            correct = (pred == target)
-            per_dim_correct.append(correct)
-
-        correct_stack = torch.stack(per_dim_correct, dim=1)  # [bs, n_dim]
-        enough = correct_stack.float() >= self.threshold
-
-        # choose smallest valid idx; fallback to largest dim
-        fallback = torch.full((q.size(0),), len(dim_levels) - 1, device=q.device, dtype=torch.long)
-        has_hit = enough.any(dim=1)
-        first_hit = enough.float().argmax(dim=1)
-        target_idx = torch.where(has_hit, first_hit, fallback)
-        return target_idx, costs
-
-    def forward(self, model_trainer, input_data: Dict[str, Dict[str, Tensor]]) -> Dict[str, Tensor]:
-        model = model_trainer.model
-        qry = model.encode_input(input_data["qry"])[0]
-        pos = model.encode_input(input_data["pos"])[0]
-
-        if self.world_size > 1:
-            qry = self._dist_gather_tensor(qry)
-            pos = self._dist_gather_tensor(pos)
-
-        target = torch.arange(qry.size(0), device=qry.device, dtype=torch.long)
-        target_per_qry = pos.size(0) // qry.size(0)
-        target = target * target_per_qry
-
-        router = getattr(model, "router_head", None)
-        if router is None:
-            raise RuntimeError("Router head missing on model. Attach `model.router_head` before adaptive_router training.")
-        router_logits = router(qry)
-        target_dim_idx, dim_costs = self._target_from_retrieval(qry, pos, target)
-
-        router_ce = F.cross_entropy(router_logits, target_dim_idx)
-
-        probs = F.softmax(router_logits, dim=-1)
-        normalized_costs = dim_costs / dim_costs.max().clamp_min(1.0)
-        compute_penalty = (probs * normalized_costs.unsqueeze(0)).sum(dim=-1).mean()
-
-        loss = router_ce + self.alpha * compute_penalty
-
-        pred_idx = router_logits.argmax(dim=-1)
-        acc = (pred_idx == target_dim_idx).float().mean()
-
-        return {
-            "loss": loss,
-            # Keep `contrastive_loss` key for trainer compatibility; map it to total router objective.
-            "contrastive_loss": loss,
-            "router_total_loss": loss.detach(),
-            "router_ce_loss": router_ce.detach(),
-            "router_compute_penalty": compute_penalty.detach(),
-            "router_acc": acc.detach(),
-        }
