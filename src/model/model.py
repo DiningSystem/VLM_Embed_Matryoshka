@@ -60,6 +60,18 @@ class MMEBModel(nn.Module):
             "Enable `output_hidden_states=True` for this backbone."
         )
 
+    def _extract_pooled_output(self, encoded_output):
+        """
+        Normalize encode_input outputs across backbones.
+
+        Some backbones return a tensor directly (pooled reps), while others return
+        tuples where index 0 is pooled reps and subsequent entries are auxiliary
+        outputs (image features / attentions / hidden states).
+        """
+        if isinstance(encoded_output, tuple):
+            return encoded_output[0]
+        return encoded_output
+
     def encode_input(self, input, output_hidden_states: bool = False, output_attentions: bool = False):
         INTERNVIDEO2 = "internvideo2"
         if getattr(self, "model_backbone", None) == INTERNVIDEO2:
@@ -484,11 +496,11 @@ class MMEBModel(nn.Module):
             setattr(model_args, 'model_backbone', model_backbone)
         print_master(f'Loading backbone [{model_args.model_backbone}] from {model_args.model_name}')
         if model_args.model_backbone in {LLAVA_ONEVISION, LLAVA_NEXT, QWEN2_VL, QWEN2_5_VL, QWEN2_VL_TOKENSELECTION, QWEN2_5_VL_TOKENSELECTION, QWEN3_VL}:
-            config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
+            config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
             config._attn_implementation = "eager"
             config.vision_config._attn_implementation = "eager"
             base_model = backbone2model[model_args.model_backbone].from_pretrained(
-                model_args.model_name,
+                model_name_or_path,
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
                 config=config
@@ -498,7 +510,7 @@ class MMEBModel(nn.Module):
             config.padding_side = "left"
             config.use_cache = False
             base_model = backbone2model[model_backbone].from_pretrained(
-                model_args.model_name,
+                model_name_or_path,
                 config=config,
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
@@ -509,10 +521,10 @@ class MMEBModel(nn.Module):
             #! hardcoded. Also check hardcoded values in processor
             base_model.img_context_token_id=151667
         elif model_args.model_backbone == PHI3V:
-            config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
+            config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
             config.use_cache = False
             config.padding_side = "right"
-            base_model = Phi3VForCausalLM.from_pretrained(model_args.model_name, **kwargs, config=config,
+            base_model = Phi3VForCausalLM.from_pretrained(model_name_or_path, **kwargs, config=config,
                                                           torch_dtype=torch.bfloat16, trust_remote_code=True)
             base_model.padding_side = "right"
         elif model_args.model_backbone == INTERNVIDEO2:
@@ -522,26 +534,26 @@ class MMEBModel(nn.Module):
             base_model = backbone2model[model_args.model_backbone].from_pretrained("src/model/vlm_backbone/internvideo2/", config=config,
                                                                                    trust_remote_code=True)
         elif model_args.model_backbone == GME:
-            base_model = GmeQwen2VL(model_args.model_name, processor=kwargs['processor'])
+            base_model = GmeQwen2VL(model_name_or_path, processor=kwargs['processor'])
             setattr(base_model, 'config', config)
         elif model_args.model_backbone == LamRA:
-            base_model = LamRAQwen2VL(model_args.model_name)
+            base_model = LamRAQwen2VL(model_name_or_path)
             setattr(base_model, 'config', config)
         elif model_args.model_backbone == COLPALI:
-            base_model = ColPali.from_pretrained(model_args.model_name)
+            base_model = ColPali.from_pretrained(model_name_or_path)
             setattr(base_model, 'config', config)
         elif model_args.model_backbone == SMOLVLM:
             config._attn_implementation = "eager"
             config.use_cache = False
             base_model = backbone2model[model_args.model_backbone].from_pretrained(
-                model_args.model_name,
+                model_name_or_path,
                 config=config,
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True,
             )
         else:
             # Loading external base model from HF
-            config = AutoConfig.from_pretrained(model_args.model_name, trust_remote_code=True)
+            config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
             config.use_cache = False
             base_model = cls.TRANSFORMER_CLS.from_pretrained(
                 model_name_or_path, **kwargs, config=config,
@@ -616,8 +628,20 @@ class MMEBModel(nn.Module):
 
     def forward(self, qry: Dict[str, Tensor] = None, tgt: Dict[str, Tensor] = None, *args, **kwargs):
         # print(f"qry keys: {qry.keys() if qry else None}, tgt keys: {tgt.keys() if tgt else None}")
-        qry_reps = self.encode_input(qry, output_hidden_states=False, output_attentions=False)[0] if qry else None  # (bsz_per_device, dim)
-        tgt_reps = self.encode_input(tgt, output_hidden_states=False, output_attentions=False)[0] if tgt else None # (bsz_per_device, dim)
+        qry_reps = (
+            self._extract_pooled_output(
+                self.encode_input(qry, output_hidden_states=False, output_attentions=False)
+            )
+            if qry
+            else None
+        )  # (bsz_per_device, dim)
+        tgt_reps = (
+            self._extract_pooled_output(
+                self.encode_input(tgt, output_hidden_states=False, output_attentions=False)
+            )
+            if tgt
+            else None
+        )  # (bsz_per_device, dim)
 
         if qry_reps is None or tgt_reps is None:
             return {"qry_reps": qry_reps, "tgt_reps": tgt_reps}
