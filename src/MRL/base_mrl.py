@@ -36,8 +36,8 @@ class MatryoshkaContrastiveLoss(nn.Module):
         student_input_pos = input_data['pos']
 
         # Encode query and positive — get full-dim embeddings (unnormalized)
-        student_qry_reps = model.encode_input(student_input_qry)[0]
-        student_pos_reps = model.encode_input(student_input_pos)[0]
+        student_qry_reps = model._extract_pooled_output(model.encode_input(student_input_qry))
+        student_pos_reps = model._extract_pooled_output(model.encode_input(student_input_pos))
         
         if self.world_size > 1:
             all_student_qry_reps = self._dist_gather_tensor(student_qry_reps)

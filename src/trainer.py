@@ -19,7 +19,6 @@ import math
 from src.data.collator.train_collator import split_vlm_inputs, get_dense_rep, split_and_process_vlm_inputs
 from src.model.model import MMEBModel
 from src.loss import SimpleContrastiveLoss, DistributedContrastiveLoss
-from src.MRL import build_criterion
 from src.grad_cache.grad_cache import GradCache
 from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler, SequentialSampler
 
@@ -651,11 +650,7 @@ class GradCacheLateProcessTrainer(MMEBTrainer):
         super(GradCacheLateProcessTrainer, self).__init__(*args, **kwargs)
         self.is_ddp = dist.is_initialized()
         self._dist_loss_scale_factor = dist.get_world_size() if self.is_ddp else 1
-        # loss_fn_cls = DistributedContrastiveLoss if self.is_ddp else SimpleContrastiveLoss
-        if self.is_ddp:
-            if "dist" not in args.kd_loss_type:
-                args.kd_loss_type = "dist_" + args.kd_loss_type
-        loss_fn_cls = build_criterion(args)
+        loss_fn_cls = DistributedContrastiveLoss if self.is_ddp else SimpleContrastiveLoss
         loss_fn = loss_fn_cls(temperature=self.model.temperature)
         # process_fn = functools.partial(process_vlm_inputs_fns[self.args.model_backbone], processor=self.processing_class, max_length=self.max_length)
 
@@ -675,14 +670,12 @@ class GradCacheLateProcessTrainer(MMEBTrainer):
         queries, targets = inputs
         queries = batch_to_device(queries, model.device)
         targets = batch_to_device(targets, model.device)
-        queries, targets = {'qry': queries}, {'tgt': targets}
 
-        _distributed = self.args.local_rank > -1
-        if _distributed:
+        if self.is_ddp:
             self.gc.models = [model, model]
-            loss = self.gc(queries, targets, no_sync_except_last=_distributed)
+            loss = self.gc({'qry': queries}, {'tgt': targets}, no_sync_except_last=True)
         else:
-            loss = model(queries, targets)
+            loss = model(qry=queries, tgt=targets)
         return loss / self._dist_loss_scale_factor
 
 

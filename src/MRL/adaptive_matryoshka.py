@@ -69,9 +69,20 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
             return x[:, :dim]
         if src_dim < dim:
             raise ValueError(f"Cannot project {src_dim} -> {dim}: source dim is smaller.")
-        if not hasattr(model, "matryoshka_proj_bank"):
+        proj_bank = self._get_projection_bank(model)
+        if proj_bank is None:
             raise RuntimeError("Model missing `matryoshka_proj_bank`. Attach it before stage1 training.")
-        return model.matryoshka_proj_bank.project(x[:, :src_dim], src_dim=src_dim, dst_dim=dim)
+        return proj_bank.project(x[:, :src_dim], src_dim=src_dim, dst_dim=dim)
+
+    @staticmethod
+    def _unwrap_model(model):
+        while hasattr(model, "module"):
+            model = model.module
+        return model
+
+    def _get_projection_bank(self, model):
+        base_model = self._unwrap_model(model)
+        return getattr(base_model, "matryoshka_proj_bank", None)
 
     def _cross_alignment_l1(
         self,
@@ -197,8 +208,10 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
           - Comma-separated lists are supported, e.g. "A,C" or "0,2,4".
           - "ALL" means include every available stage built from nested_dims.
 
-        If selection is empty or invalid, defaults to [0] (largest/full dimension stage).
+        If selection is empty or invalid, defaults to all available stage pairs.
         """
+        if not stage_pairs:
+            return []
         max_idx = len(stage_pairs) - 1
         phase = self.phase.strip().upper()
 
@@ -223,7 +236,7 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
                         selected_ids.append(ord(last_char) - ord("A"))
 
         selected_ids = sorted({idx for idx in selected_ids if 0 <= idx <= max_idx})
-        return selected_ids or [0]
+        return selected_ids or list(range(len(stage_pairs)))
 
     def _parse_pair_weight_map(self, spec) -> Dict[Tuple[int, int], float]:
         """
@@ -396,8 +409,9 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
                 default=1.0,
             )
 
-            if hasattr(model, "matryoshka_proj_bank"):
-                base_orth = model.matryoshka_proj_bank.orthogonality_loss(src_dim=teacher_dim, dst_dim=student_dim)
+            proj_bank = self._get_projection_bank(model)
+            if proj_bank is not None:
+                base_orth = proj_bank.orthogonality_loss(src_dim=teacher_dim, dst_dim=student_dim)
                 orth_pair_weight = self._resolve_pair_weight(
                     self.orthogonal_pair_weights,
                     teacher_dim,
