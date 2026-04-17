@@ -490,7 +490,14 @@ class AdaptiveMatryoshkaStage1Loss(nn.Module):
                 orth_pair_weight = 1.0
                 orth_loss = torch.zeros_like(weighted_align_loss)
 
-            total = projection_weight * weighted_align_loss + self.orthogonal_weight * projection_weight * orth_loss
+            if hasattr(model, "matryoshka_proj_bank") and getattr(
+                model.matryoshka_proj_bank, "use_orthogonal_parametrization", False
+            ):
+                # Parametrized orthogonal maps (cayley/matrix_exp) enforce the constraint
+                # in-parameterization, so we ignore explicit orthogonal regularization weight.
+                total = projection_weight * weighted_align_loss
+            else:
+                total = projection_weight * weighted_align_loss + self.orthogonal_weight * projection_weight * orth_loss
 
             metrics[f"align_ce_{teacher_dim}_to_{student_dim}"] = align_ce.detach()
             metrics[f"align_l1_{teacher_dim}_to_{student_dim}"] = align_l1.detach()
@@ -532,12 +539,14 @@ class PairwiseProjectionBank(nn.Module):
 
     def __init__(self, dimension_pairs: List[Tuple[int, int]], orthogonal_projection_map: str = ""):
         super().__init__()
-        self.orthogonal_projection_map = str(orthogonal_projection_map or "").strip().lower()
+        requested_map = str(orthogonal_projection_map or "").strip().lower()
+        # Accept "explicit" as a user-facing alias for "no parametrization".
+        self.orthogonal_projection_map = "" if requested_map in {"", "explicit"} else requested_map
         self.use_orthogonal_parametrization = self.orthogonal_projection_map in {"cayley", "matrix_exp", "cayley_safe"}
         if self.orthogonal_projection_map and not self.use_orthogonal_parametrization:
             raise ValueError(
                 f"Unsupported orthogonal_projection_map={self.orthogonal_projection_map}. "
-                "Supported options: '', 'cayley', 'matrix_exp', 'cayley_safe'."
+                "Supported options: '', 'explicit', 'cayley', 'matrix_exp', 'cayley_safe'."
             )
         # Use `cayley_safe` to route to matrix_exp for maximal BF16/CUDA stability.
         self.effective_orthogonal_projection_map = (
@@ -584,6 +593,10 @@ class PairwiseProjectionBank(nn.Module):
     def project(self, x: Tensor, src_dim: int, dst_dim: int) -> Tensor:
         if src_dim == dst_dim:
             return x[:, :dst_dim]
+        # For higher->smaller projections, optimize projection weights from a detached
+        # source representation to keep this path as a pure projection/orthogonality
+        # contribution.
+        x_in = x.detach()
         key = self._key(src_dim, dst_dim)
         if self.use_orthogonal_parametrization:
             if key not in self.projection_layers:
@@ -594,13 +607,13 @@ class PairwiseProjectionBank(nn.Module):
                 # Run true-cayley projection in FP32 with autocast disabled, then cast back.
                 # This preserves true cayley behavior while avoiding BF16 CUDA solver failures.
                 with torch.autocast(device_type=x.device.type, enabled=False):
-                    projected = layer(x.float())
+                    projected = layer(x_in.float())
                 return projected.to(dtype=out_dtype)
-            return layer(x)
+            return layer(x_in)
 
         if key not in self.projections:
             raise KeyError(f"Missing projection matrix for {src_dim}->{dst_dim}.")
-        return x @ self.projections[key]
+        return x_in @ self.projections[key]
 
     def orthogonality_loss(self, src_dim: int, dst_dim: int) -> Tensor:
         if self.use_orthogonal_parametrization:

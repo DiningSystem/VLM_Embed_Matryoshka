@@ -1,33 +1,33 @@
 torchrun \
-    --standalone \
-    --nproc_per_node=1 \
-    --master_port=29500 \
-    train_ddp_one_model.py \
-    --lora \
-    --lora_r 64 \
-    --lora_alpha 128 \
-    --model_name HuggingFaceTB/SmolVLM-256M-Instruct \
-    --model_backbone "idefics3" \
-    --bf16 \
-    --pooling eos \
-    --normalize True \
-    --temperature 0.02 \
-    --dataset_name "TIGER-Lab/MMEB-train" \
-    --subset_name "OK-VQA" \
-    --dataset_split "original" \
-    --image_dir "/workspace/ComfyUI/models/gligen/VLM_Embed/vlm2vec_train/MMEB-train" \
-    --output_dir "training/MRL_fastVLM" \
-    --per_device_train_batch_size 16 \
-    --gradient_accumulation_steps 1 \
-    --lr_scheduler_type cosine \
-    --learning_rate 1e-5 \
-    --num_train_epochs 2 \
-    --bf16 \
-    --save_total_limit 2 \
-    --logging_steps 1 \
-    --save_strategy "epoch" \
-    --seed 42 \
-    --weight_decay 0.01 \
-    --kd_loss_type mrl \
-    --warmup_ratio 0.03 \
-    --image_resolution low
+  --standalone \
+  --nproc_per_node=1 \
+  --master_port=29500 \
+  train_ddp_one_model.py \
+  --lora \
+  --lora_r 64 \
+  --lora_alpha 128 \
+  --model_name HuggingFaceTB/SmolVLM-256M-Instruct \
+  --model_backbone "idefics3" \
+  --bf16 \
+  --pooling eos \
+  --normalize True \
+  --temperature 0.02 \
+  --dataset_name "TIGER-Lab/MMEB-train" \
+  --subset_name "OK-VQA" \
+  --dataset_split "original" \
+  --image_dir "/workspace/ComfyUI/models/gligen/VLM_Embed/vlm2vec_train/MMEB-train" \
+  --output_dir "training/MRL_fastVLM" \
+  --per_device_train_batch_size 16 \
+  --gradient_accumulation_steps 1 \
+  --lr_scheduler_type cosine \
+  --learning_rate 1e-5 \
+  --num_train_epochs 2 \
+  --bf16 \
+  --save_total_limit 2 \
+  --logging_steps 1 \
+  --save_strategy "epoch" \
+  --seed 42 \
+  --weight_decay 0.01 \
+  --kd_loss_type mrl \
+  --warmup_ratio 0.03 \
+  --image_resolution low

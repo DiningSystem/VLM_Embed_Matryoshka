@@ -160,7 +160,7 @@ class TrainingArguments(TrainingArguments):
     )
     projection_orthogonal_map: str = field(
         default="",
-        metadata={"help": "Optional orthogonal parametrization for projection matrices. Options: '', 'matrix_exp', 'cayley', 'cayley_safe'. Use 'cayley' for true Cayley map (executed in FP32 under mixed precision), or 'cayley_safe' to route to 'matrix_exp'. This disables explicit orthogonal_weight regularization."},
+        metadata={"help": "Optional orthogonal parametrization for projection matrices. Options: '', 'explicit', 'matrix_exp', 'cayley', 'cayley_safe'. 'explicit' is an alias for '' (use explicit orthogonal_weight regularization). 'cayley' runs true Cayley map (executed in FP32 under mixed precision), and 'cayley_safe' routes to 'matrix_exp'. Parametrized modes disable explicit orthogonal_weight regularization."},
     )
     spectrum_kl_weight: float = field(
         default=0.0,

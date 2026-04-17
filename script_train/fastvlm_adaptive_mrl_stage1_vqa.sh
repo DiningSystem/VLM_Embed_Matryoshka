@@ -38,7 +38,7 @@ torchrun \
     --full_dim_l1_weight 0.0 \
     --align_l1_weights "64:0.75,128:0.75,256:0.75,512:0.75,768:0.75" \
     --orthogonal_weight 0.005 \
-    --projection_orthogonal_map ""\
+    --projection_orthogonal_map explicit \
     --spectrum_kl_weight 0.35 \
     --spectrum_loss_type laplacian_kl \
     --laplacian_tau 0.07 \
