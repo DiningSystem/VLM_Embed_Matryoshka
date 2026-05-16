@@ -13,12 +13,13 @@ torchrun \
     --normalize True \
     --temperature 0.02 \
     --dataset_name "TIGER-Lab/MMEB-train" \
-    --subset_name "OK-VQA" "A-OKVQA" "DocVQA" "InfographicsVQA" "ChartQA" "Visual7W" \
+    --subset_name "ImageNet_1K" "N24News" "SUN397" "HatefulMemes" "VOC2007" \
     --dataset_split "original" \
-    --image_dir "/workspace/ComfyUI/models/gligen/VLM_Embed/vlm2vec_train/MMEB-train" \
-    --output_dir "training/ese_fastVLM_vqa" \
-    --per_device_train_batch_size 64 \
+    --image_dir "vlm2vec_train/MMEB-train" \
+    --output_dir "training/MRL_fastVLM_cls_b16" \
+    --per_device_train_batch_size 8 \
     --gradient_accumulation_steps 1 \
+    --kd_loss_type "mrl" \
     --lr_scheduler_type cosine \
     --learning_rate 5e-5 \
     --num_train_epochs 2 \
@@ -28,8 +29,7 @@ torchrun \
     --save_strategy "epoch" \
     --seed 42 \
     --weight_decay 0.01 \
-    --kd_loss_type ese \
+    --kd_loss_type mrl \
     --warmup_ratio 0.03 \
-    --kd_weight 0.01 \
-    --image_resolution high \
+    --image_resolution mid \
     --nested_dims 64 128 256 512 768 896
