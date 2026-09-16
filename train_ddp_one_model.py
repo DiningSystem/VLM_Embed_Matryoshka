@@ -166,6 +166,11 @@ class Trainer:
                 
                 student = self.trainer.module.model
                 student.encoder.save_pretrained(ckpt_dir)
+                if hasattr(self.trainer.module, "cms_criterion"):
+                    torch.save(
+                        self.trainer.module.cms_criterion.state_dict(),
+                        os.path.join(ckpt_dir, "cms_router.pt"),
+                    )
                 if self.model_args.model_backbone in ["llava_onevision", "llava_two_vision"]:
                     torch.save(student.encoder.model.multi_modal_projector.state_dict(), projector_dir)
                 elif self.model_args.model_backbone in ["llava_qwen2"]:
@@ -241,8 +246,13 @@ def main():
     print(f"Len of train dataset: {len(train_dataloader.dataset)}")
     total_steps = (len(train_dataloader.dataset) // (training_args.per_device_train_batch_size * dist.get_world_size()) // training_args.gradient_accumulation_steps) * training_args.num_train_epochs
 
+    criterion = build_criterion(training_args)
+    # Register CMS modules on the DDP root so router parameters are synchronized
+    # and included in checkpointed training state.
+    if training_args.kd_loss_type.startswith("cms_"):
+        model_trainer.cms_criterion = criterion
     optimizer = AdamW(
-        model_trainer.model.parameters(),
+        model_trainer.parameters(),
         lr=training_args.learning_rate,
         betas=(0.9, 0.999),
         eps=1e-8,
@@ -268,7 +278,6 @@ def main():
         from transformers import get_constant_schedule
         lr_scheduler = get_constant_schedule(optimizer)
         
-    criterion = build_criterion(training_args)
     trainer = Trainer(model_trainer, train_dataloader, optimizer, lr_scheduler, criterion, model_args, training_args)
     trainer.train()
     

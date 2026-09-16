@@ -1,9 +1,13 @@
 from .base_mrl import MatryoshkaContrastiveLoss
 from .ese import ESELoss
+from .cms_mrl import CMSMatryoshkaLoss
 
 criterion_dict = {
     "mrl": MatryoshkaContrastiveLoss,
-    "ese": ESELoss
+    "ese": ESELoss,
+    "cms_mrl": CMSMatryoshkaLoss,
+    "cms_ug": CMSMatryoshkaLoss,
+    "cms_cmi": CMSMatryoshkaLoss,
 }
 
 def build_criterion(args):
