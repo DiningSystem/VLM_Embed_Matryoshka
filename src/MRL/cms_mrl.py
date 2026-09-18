@@ -13,6 +13,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ConditionalGroupRouter(nn.Module):
+    """Score a group from fixed-size activation statistics.
+
+    A router that consumes the full embedding would require a backbone-specific
+    input dimension.  Using mean, variance, and RMS activation per group keeps
+    the router conditional on the input while making all of its parameters
+    materialized before DistributedDataParallel is constructed.
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, groups: torch.Tensor) -> torch.Tensor:
+        groups = groups.float()
+        features = torch.stack(
+            (
+                groups.mean(dim=-1),
+                groups.var(dim=-1, unbiased=False),
+                groups.square().mean(dim=-1).sqrt(),
+            ),
+            dim=-1,
+        )
+        return self.network(features).squeeze(-1)
+
+
 class CMSMatryoshkaLoss(nn.Module):
     """Multi-budget InfoNCE with utility-guided and CMI routing objectives.
 
@@ -29,8 +59,7 @@ class CMSMatryoshkaLoss(nn.Module):
         self.cmi_weight = getattr(args, "cms_cmi_weight", 0.1)
         self.loss_type = getattr(args, "kd_loss_type", "cms_mrl")
         hidden = getattr(args, "cms_router_hidden_dim", 256)
-        # LazyLinear makes the criterion independent of a backbone hidden size.
-        self.router = nn.Sequential(nn.LazyLinear(hidden), nn.GELU(), nn.Linear(hidden, self.num_groups))
+        self.router = ConditionalGroupRouter(hidden)
 
     @staticmethod
     def _unpack(encoded):
@@ -71,7 +100,7 @@ class CMSMatryoshkaLoss(nn.Module):
         q_groups, width = self._group(query)
         p_groups, _ = self._group(target)
         all_p_groups, _ = self._group(all_target)
-        router_logits = self.router(query.float()).to(query.dtype)
+        router_logits = self.router(q_groups).to(query.dtype)
         order = router_logits.argsort(dim=-1, descending=True)
         selected = torch.zeros_like(router_logits, dtype=torch.bool)
         base_loss = query.new_zeros(())
