@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # CMS-MRL FULL run for apple/FastVLM-0.5B.
-torchrun --standalone --nproc_per_node=1 train_ddp_one_model.py \
+torchrun --standalone --nproc_per_node=1 --master_port=29500 train_ddp_one_model.py \
     --lora --lora_r 64 --lora_alpha 128 \
     --model_name apple/FastVLM-0.5B --model_backbone llava_qwen2 \
     --bf16 --pooling eos --normalize True --temperature 0.02 \
