@@ -1,7 +1,7 @@
 # CSM-VL: Conditional Subspace Matryoshka for Vision-Language Embeddings
 
 This repository trains vision-language retrieval encoders with Matryoshka
-representations. In addition to the existing fixed-prefix MRL, ESE, MIPIC, losses,
+representations. In addition to the existing fixed-prefix MRL, ESE, MIPIC,
 it includes **CSM-VL (Conditional Subspace Matryoshka for Vision-Language
 Embeddings)**: a router selects an input-specific order of embedding groups,
 so every prefix is nested while its active dimensions can differ across
