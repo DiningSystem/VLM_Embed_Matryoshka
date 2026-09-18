@@ -82,7 +82,7 @@ follows the Qwen3-VL-2B optimization configuration.
 
 ### Training scripts
 
-All scripts use the MMEB VQA subsets and reside in `script_train/`.
+All scripts use the MMEB VQA subsets and reside in `script_train/`. Remember to change to correct image directory that contains downloaded images. Same for evaluation process.
 
 | Backbone              | Full CSM-VL                  | UG ablation                | CMI ablation                |
 | --------------------- | ---------------------------- | -------------------------- | --------------------------- |
