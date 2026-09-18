@@ -49,7 +49,10 @@ def process_image(image, resolution, max_dim=1024):
     elif resolution == "low":
         target_max = 448
     else:
-        target_max = max_dim
+        try:
+            target_max = int(resolution)
+        except (TypeError, ValueError):
+            target_max = max_dim
 
     # Tính tỉ lệ scale sao cho cạnh lớn nhất = target_max
     if max_side > target_max:
