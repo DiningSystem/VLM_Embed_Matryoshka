@@ -124,7 +124,7 @@ class CMSMatryoshkaLoss(nn.Module):
                 candidate_losses = []
                 for group in range(self.num_groups):
                     candidate = selected.clone()
-                    candidate[:, group] |= available[:, group]
+                    candidate[:, group] = candidate[:, group] | available[:, group]
                     candidate_losses.append(self._infonce(q_groups, all_p_groups, candidate.unsqueeze(-1).to(query.dtype), positives, reduction="none"))
                 utilities = torch.stack([current - value for value in candidate_losses], dim=-1)
                 utility_target = F.softmax(utilities / self.utility_temperature, dim=-1)
@@ -139,9 +139,13 @@ class CMSMatryoshkaLoss(nn.Module):
             redundancy = redundancy.square() * (1 - torch.eye(self.num_groups, device=query.device)).unsqueeze(0)
             cmi_loss = cmi_loss + torch.einsum("bi,bij,bj->b", probabilities.float(), redundancy, probabilities.float()).mean()
 
-            selected.scatter_(1, order[:, step : step + 1], True)
+            # Do not update ``selected`` in place. ``masked_logits`` retains
+            # this boolean mask for its backward pass, and an in-place scatter
+            # would trigger PyTorch's tensor-versioning autograd error.
+            next_selected = selected.scatter(1, order[:, step : step + 1], True)
             # The selected prefix is nested by construction.
-            base_loss = base_loss + self._infonce(q_groups, all_p_groups, selected.unsqueeze(-1).to(query.dtype), positives)
+            base_loss = base_loss + self._infonce(q_groups, all_p_groups, next_selected.unsqueeze(-1).to(query.dtype), positives)
+            selected = next_selected
 
         base_loss = base_loss / self.num_groups
         ug_loss = ug_loss / self.num_groups

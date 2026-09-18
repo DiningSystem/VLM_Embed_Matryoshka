@@ -65,6 +65,16 @@ All scripts use the MMEB VQA subsets and reside in `script_train/`.
 | Qwen3-VL-Embedding-2B | `qwen3vl_2b_cms_full_vqa.sh` | `qwen3vl_2b_cms_ug_vqa.sh` | `qwen3vl_2b_cms_cmi_vqa.sh` |
 | Qwen3-VL-Embedding-8B | `qwen3vl_8b_cms_full_vqa.sh` | `qwen3vl_8b_cms_ug_vqa.sh` | `qwen3vl_8b_cms_cmi_vqa.sh` |
 
+Classification runs use the ten MMEB classification subsets (`ImageNet_1K`,
+`HatefulMemes`, `SUN397`, `N24News`, `VOC2007`, `Place365`, `ImageNet-A`,
+`ImageNet-R`, `ObjectNet`, and `Country211`):
+
+| Backbone | Full CMS-MRL | UG ablation | CMI ablation |
+| --- | --- | --- | --- |
+| FastVLM-0.5B | `fastvlm_cms_full_cls.sh` | `fastvlm_cms_ug_cls.sh` | `fastvlm_cms_cmi_cls.sh` |
+| Qwen3-VL-Embedding-2B | `qwen3vl_2b_cms_full_cls.sh` | `qwen3vl_2b_cms_ug_cls.sh` | `qwen3vl_2b_cms_cmi_cls.sh` |
+| Qwen3-VL-Embedding-8B | `qwen3vl_8b_cms_full_cls.sh` | `qwen3vl_8b_cms_ug_cls.sh` | `qwen3vl_8b_cms_cmi_cls.sh` |
+
 For example, train the full 8B model with:
 
 ```bash
