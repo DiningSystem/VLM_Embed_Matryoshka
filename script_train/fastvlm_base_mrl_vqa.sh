@@ -5,7 +5,7 @@ torchrun \
     train_ddp_one_model.py \
     --lora \
     --lora_r 64 \
-    --lora_alpha 128 \
+    --lora_alpha 64 \
     --model_name apple/FastVLM-0.5B \
     --model_backbone "llava_qwen2" \
     --bf16 \
@@ -17,12 +17,13 @@ torchrun \
     --dataset_split "original" \
     --image_dir "/workspace/ComfyUI/models/gligen/VLM_Embed/vlm2vec_train/MMEB-train" \
     --output_dir "training/MRL_fastVLM_vqa" \
-    --per_device_train_batch_size 64 \
+    --per_device_train_batch_size 32 \
     --gradient_accumulation_steps 1 \
     --kd_loss_type "mrl" \
+    --projector_lr 5e-4 \
     --lr_scheduler_type cosine \
-    --learning_rate 5e-5 \
-    --num_train_epochs 2 \
+    --learning_rate 1e-4 \
+    --num_train_epochs 1 \
     --bf16 \
     --save_total_limit 5 \
     --logging_steps 1 \
@@ -31,5 +32,5 @@ torchrun \
     --weight_decay 0.01 \
     --kd_loss_type mrl \
     --warmup_ratio 0.03 \
-    --image_resolution mid \
+    --image_resolution 448 \
     --nested_dims 64 128 256 512 768 896

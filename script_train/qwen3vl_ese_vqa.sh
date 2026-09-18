@@ -4,7 +4,7 @@ torchrun \
     --master_port=29500 \
     train_ddp_one_model.py \
     --lora \
-    --lora_r 16 \
+    --lora_r 64 \
     --lora_alpha 64 \
     --model_name Qwen/Qwen3-VL-Embedding-2B \
     --model_backbone "qwen3_vl" \
@@ -20,8 +20,9 @@ torchrun \
     --per_device_train_batch_size 16 \
     --gradient_accumulation_steps 1 \
     --kd_loss_type "mrl" \
+    --projector_lr 5e-4 \
     --lr_scheduler_type cosine \
-    --learning_rate 1e-5 \
+    --learning_rate 1e-4 \
     --num_train_epochs 1 \
     --bf16 \
     --save_total_limit 2 \
@@ -31,5 +32,5 @@ torchrun \
     --weight_decay 0.01 \
     --kd_loss_type ese \
     --warmup_ratio 0.03 \
-    --image_resolution mid \
+    --image_resolution 336 \
     --nested_dims 64 128 256 512 768 1024 2048

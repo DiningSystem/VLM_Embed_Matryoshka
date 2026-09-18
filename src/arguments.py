@@ -118,6 +118,11 @@ class TrainingArguments(TrainingArguments):
     )
     w_cross_modal_loss: float = field(default=1.0, metadata={"help": "weight for cross modal loss"})
     nested_dims: List[int] = field(default_factory=list, metadata={"help": "List of dimensions for matryoshka evaluation, e.g. [64, 128, 256]"})
+    cms_num_groups: int = field(default=8, metadata={"help": "Number of equal-sized functional groups used by CMS-MRL"})
+    cms_router_hidden_dim: int = field(default=256, metadata={"help": "Hidden size of the CMS-MRL conditional router"})
+    cms_utility_temperature: float = field(default=0.1, metadata={"help": "Temperature for utility-guided routing targets"})
+    cms_utility_weight: float = field(default=0.45, metadata={"help": "Weight of the CMS-MRL utility-guided routing loss"})
+    cms_cmi_weight: float = field(default=0.55, metadata={"help": "Weight of the CMS-MRL conditional multimodal interaction loss"})
 @dataclass
 class MTEBArguments:
     device: str = field(default="cuda", metadata={"help": "use cuda for single GPU inference, if multiple GPUs are available it will use DP automatically"})
