@@ -26,9 +26,6 @@ processor issue, run `python fix_lib.py`.
 The implementation partitions the embedding into equal-sized, disjoint groups.
 For each query, a lightweight MLP router ranks the groups. Selecting the first
 `k` entries of that ranking creates a strictly nested subspace at each budget.
-The router consumes per-group activation statistics (mean, variance, and RMS),
-so its parameters have a fixed shape across backbones and are initialized
-before DistributedDataParallel starts.
 The training objective combines:
 
 1. **Base loss (`L_base`)** — InfoNCE at every routed prefix.
