@@ -7,7 +7,7 @@ torchrun --standalone --nproc_per_node=1 --master_port=29500 train_ddp_one_model
     --model_name apple/FastVLM-0.5B --model_backbone llava_qwen2 \
     --bf16 --pooling eos --normalize True --temperature 0.02 \
     --dataset_name TIGER-Lab/MMEB-train \
-    --subset_name OK-VQA A-OKVQA DocVQA InfographicsVQA ChartQA Visual7W \
+    --subset_name OK-VQA \
     --dataset_split original \
     --image_dir ./vlm2vec_train/MMEB-train \
     --output_dir training/CMSMRL_FastVLM_vqa_full \
